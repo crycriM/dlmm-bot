@@ -39,6 +39,7 @@ class HedgeConfig:
     per_trade_cost_bps: float = 2.0  # cost per hedge trade
     delta_cap_bps: float = 200.0     # hard cap on residual delta
     cube_root_constant: float = 1.0  # calibration constant for band
+    deadband_base: float = 0.0      # base deadband in base units
     venue: str = "hl"
     coin: str = ""
     enabled: bool = True
