@@ -1,4 +1,4 @@
-# dlmm_bot
+# dlmm-bot
 
 Dynamic Limit Order market-making bot for Meteora-style DLMM pools on Solana.
 
@@ -6,7 +6,7 @@ This package is the **DLMM execution-side bot** described in `clmm-animation/doc
 
 ## What this bot does
 
-`dlmm_bot` is the venue-specific layer for:
+`dlmm-bot` is the venue-specific layer for:
 
 - **DLMM ladder placement** around an AS reservation price
 - **Keeper loop** that polls state, evaluates regime/risk, and refreshes liquidity
@@ -20,7 +20,7 @@ This package is the **DLMM execution-side bot** described in `clmm-animation/doc
 The split is intentional:
 
 - **`mm_core`** owns shared math and policy: AS formulas, regime detection, risk policy, PnL, markout, contracts
-- **`dlmm_bot`** owns DLMM-specific geometry, ladder construction, keeper orchestration, Solana-side risk, and executor integration
+- **`dlmm-bot`** owns DLMM-specific geometry, ladder construction, keeper orchestration, Solana-side risk, and executor integration
 
 This matches the two-zone design from the docs: the Solana bot runs outside AWS, talks to a local executor, and can emit hedge `ExecIntent`s to the perp side without sharing execution code.
 
