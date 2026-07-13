@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field, asdict
@@ -60,6 +61,7 @@ class KeeperConfig:
     dry_run: bool = True                # shadow mode: log decisions, don't submit tx
     position_id: str | None = None     # current LP position
     max_history: int = 500              # price history deque size
+    sentinel_path: str | None = None   # kill sentinel file path (written by tvl_monitor.py)
 
 
 @dataclass
@@ -84,6 +86,8 @@ class CycleRecord:
     refresh_reason: str
     pnl_total: float = 0.0
     dry_run: bool = True
+    net_delta: float = 0.0
+    sigma: float = 0.0
 
 
 class Keeper:
@@ -149,6 +153,17 @@ class Keeper:
     async def _cycle(self) -> CycleRecord:
         """One poll→evaluate→actuate cycle."""
         ts = time.time()
+
+        if self.cfg.sentinel_path and os.path.exists(self.cfg.sentinel_path):
+            with open(self.cfg.sentinel_path) as f:
+                reason = f.read().strip()
+            logger.critical("Sentinel kill: %s", reason)
+            await self._emergency_exit()
+            os.remove(self.cfg.sentinel_path)
+            return self._make_record(
+                ts, Decision.EMERGENCY_EXIT, "emergency", "sentinel_kill",
+                refresh_reason=reason,
+            )
 
         # 1. Poll state
         state_result = self.exec.get_state(self.cfg.pool_address)
@@ -316,6 +331,8 @@ class Keeper:
                 center_bin=center_bin if 'center_bin' in dir() else self._active_bin,
                 refresh_reason=refresh_reason,
                 refresh_needed=refresh_needed,
+                net_delta=inventory.net_delta(),
+                sigma=sigma,
             )
             self._log_decision(record)
             return record
