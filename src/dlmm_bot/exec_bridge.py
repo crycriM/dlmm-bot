@@ -34,8 +34,9 @@ class ExecResult:
     data: dict | None = None
     error: str | None = None
     tx_signatures: list[str] = field(default_factory=list)
-    # On-chain receipt fields (dlmm-logging-plan §3); None when the executor
-    # does not report them (older TS shims keep working unchanged).
+    # One normalized receipt per transaction. Scalar fields remain for
+    # compatibility and mirror the final receipt.
+    tx_receipts: list[dict] = field(default_factory=list)
     slot: int | None = None
     block_time: int | None = None
     fee_lamports: int | None = None
@@ -45,6 +46,82 @@ class ExecResult:
     @property
     def succeeded(self) -> bool:
         return self.ok
+
+    @property
+    def total_fee_lamports(self) -> int | None:
+        fees = [r.get("fee_lamports") for r in self.tx_receipts]
+        known = [int(f) for f in fees if f is not None]
+        if known:
+            return sum(known)
+        return self.fee_lamports
+
+    @classmethod
+    def from_payload(cls, raw: dict) -> "ExecResult":
+        data = raw.get("data")
+        nested = data if isinstance(data, dict) else {}
+
+        def first(*keys):
+            for source in (raw, nested):
+                for key in keys:
+                    if source.get(key) is not None:
+                        return source[key]
+            return None
+
+        signatures = first("tx_signatures", "signatures")
+        if signatures is None:
+            signature = first("tx_signature", "signature", "txSignature")
+            signatures = [signature] if signature else []
+        elif isinstance(signatures, str):
+            signatures = [signatures]
+        else:
+            signatures = list(signatures)
+
+        receipt_rows = first("transactions", "tx_receipts", "receipts") or []
+        if isinstance(receipt_rows, dict):
+            receipt_rows = [receipt_rows]
+        receipts: list[dict] = []
+        for index, receipt in enumerate(receipt_rows):
+            if not isinstance(receipt, dict):
+                continue
+            receipts.append({
+                "signature": receipt.get("signature")
+                    or receipt.get("tx_signature")
+                    or (signatures[index] if index < len(signatures) else None),
+                "slot": receipt.get("slot"),
+                "block_time": receipt.get("block_time", receipt.get("blockTime")),
+                "fee_lamports": receipt.get("fee_lamports", receipt.get("fee")),
+                "compute_unit_price": receipt.get(
+                    "compute_unit_price", receipt.get("computeUnitPrice")
+                ),
+            })
+        if not receipts and signatures:
+            for index, signature in enumerate(signatures):
+                receipts.append({
+                    "signature": signature,
+                    "slot": first("slot") if index == len(signatures) - 1 else None,
+                    "block_time": first("block_time", "blockTime")
+                        if index == len(signatures) - 1 else None,
+                    "fee_lamports": first("fee_lamports", "fee")
+                        if index == len(signatures) - 1 else None,
+                    "compute_unit_price": first("compute_unit_price", "computeUnitPrice")
+                        if index == len(signatures) - 1 else None,
+                })
+
+        last = receipts[-1] if receipts else {}
+        return cls(
+            ok=bool(raw.get("ok", not raw.get("error"))),
+            data=data,
+            error=raw.get("error"),
+            tx_signatures=[str(s) for s in signatures if s],
+            tx_receipts=receipts,
+            slot=last.get("slot", first("slot")),
+            block_time=last.get("block_time", first("block_time", "blockTime")),
+            fee_lamports=last.get("fee_lamports", first("fee_lamports", "fee")),
+            compute_unit_price=last.get(
+                "compute_unit_price", first("compute_unit_price", "computeUnitPrice")
+            ),
+            position_id=first("position_id", "positionAddress"),
+        )
 
 
 class ExecBridge:
@@ -104,24 +181,7 @@ class ExecBridge:
             raw = json.loads(resp_line)
         except json.JSONDecodeError as e:
             return ExecResult(ok=False, error=f"bad JSON from executor: {e}")
-        data = raw.get("data")
-        # Receipt fields may sit at the top level or be nested in data.
-        def _receipt(key):
-            val = raw.get(key)
-            if val is None and isinstance(data, dict):
-                val = data.get(key)
-            return val
-        return ExecResult(
-            ok=bool(raw.get("ok", False)),
-            data=data,
-            error=raw.get("error"),
-            tx_signatures=raw.get("tx_signatures", data.get("tx_signatures", []) if isinstance(data, dict) else []),
-            slot=_receipt("slot"),
-            block_time=_receipt("block_time"),
-            fee_lamports=_receipt("fee_lamports"),
-            compute_unit_price=_receipt("compute_unit_price"),
-            position_id=_receipt("position_id"),
-        )
+        return ExecResult.from_payload(raw)
 
     # -- Verb wrappers ------------------------------------------------
 
@@ -241,12 +301,19 @@ class FakeExecBridge:
             if pos is None:
                 return ExecResult(ok=False, error=f"unknown position {pid}")
             return ExecResult(ok=True, data=pos)
+        receipt = {
+            "signature": "fake_tx_001",
+            "slot": self._receipt.get("slot"),
+            "block_time": self._receipt.get("block_time"),
+            "fee_lamports": self._receipt.get("fee_lamports"),
+            "compute_unit_price": self._receipt.get("compute_unit_price"),
+        }
         return ExecResult(
             ok=True, data={"method": method}, tx_signatures=["fake_tx_001"],
-            slot=self._receipt.get("slot"),
-            block_time=self._receipt.get("block_time"),
-            fee_lamports=self._receipt.get("fee_lamports"),
-            compute_unit_price=self._receipt.get("compute_unit_price"),
+            tx_receipts=[receipt],
+            slot=receipt["slot"], block_time=receipt["block_time"],
+            fee_lamports=receipt["fee_lamports"],
+            compute_unit_price=receipt["compute_unit_price"],
             position_id=self._receipt.get("position_id"),
         )
 
@@ -307,12 +374,22 @@ class ReplayExecBridge:
         self._positions = [
             e for e in events if e.get("event_type") == "position_observation"
         ]
-        self._results: dict[str, list[dict]] = {}
-        for e in events:
-            if e.get("event_type") == "action_result":
-                self._results.setdefault(str(e.get("verb", "")), []).append(e)
+        results_by_req = {
+            str(e.get("req_id")): e
+            for e in events if e.get("event_type") == "action_result"
+        }
+        self._actions: list[tuple[dict, dict]] = []
+        for request in events:
+            if request.get("event_type") != "action_request":
+                continue
+            req_id = str(request.get("req_id"))
+            result = results_by_req.get(req_id)
+            if result is None:
+                raise ValueError(f"replay: request {req_id} has no action_result")
+            self._actions.append((request, result))
         self._state_idx = 0
         self._position_idx = 0
+        self._action_idx = 0
         self.calls: list[dict] = []
 
     def _next_state(self) -> ExecResult:
@@ -329,18 +406,28 @@ class ReplayExecBridge:
             return ExecResult(ok=False, error="replay: exhausted position sequence")
         e = self._positions[self._position_idx]
         self._position_idx += 1
-        return ExecResult(ok=True, data=e.get("data"))
+        return ExecResult(
+            ok=bool(e.get("ok", True)),
+            data=e.get("data"),
+            error=e.get("error"),
+        )
 
-    def _next_result(self, verb: str) -> ExecResult:
-        queue = self._results.get(verb)
-        if not queue:
-            return ExecResult(ok=False, error=f"replay: no recorded result for {verb}")
-        e = queue.pop(0)
+    def _next_result(self, verb: str, payload: dict) -> ExecResult:
+        if self._action_idx >= len(self._actions):
+            raise ValueError(f"replay: no recorded action for {verb}")
+        request, e = self._actions[self._action_idx]
+        self._action_idx += 1
+        if request.get("verb") != verb or request.get("payload") != payload:
+            raise ValueError(
+                f"replay action mismatch: recorded={request.get('verb')} "
+                f"{request.get('payload')} replayed={verb} {payload}"
+            )
         return ExecResult(
             ok=bool(e.get("ok", False)),
             data=e.get("data"),
             error=e.get("error"),
             tx_signatures=list(e.get("tx_signatures") or []),
+            tx_receipts=list(e.get("transactions") or []),
             position_id=e.get("position_id"),
             slot=e.get("slot"),
             block_time=e.get("block_time"),
@@ -370,11 +457,16 @@ class ReplayExecBridge:
             "bin_ids": list(bin_ids), "amounts": list(amounts),
             "strategy_type": strategy_type,
         })
-        return self._next_result("deposit_single_sided")
+        return self._next_result("deposit_single_sided", {
+            "pool": pool, "side": side, "bin_ids": list(bin_ids),
+            "amounts": list(amounts), "strategy_type": strategy_type,
+        })
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
         self.calls.append({"method": "withdraw", "position_id": position_id, "bps": bps})
-        return self._next_result("withdraw")
+        return self._next_result(
+            "withdraw", {"position_id": position_id, "bps": bps}
+        )
 
     def swap(
         self, in_mint, out_mint, amount, max_slippage_bps=50, pool=None,
@@ -383,14 +475,20 @@ class ReplayExecBridge:
             "method": "swap", "in_mint": in_mint, "out_mint": out_mint,
             "amount": amount, "max_slippage_bps": max_slippage_bps, "pool": pool,
         })
-        return self._next_result("swap")
+        return self._next_result("swap", {
+            "in_mint": in_mint, "out_mint": out_mint, "amount": amount,
+            "max_slippage_bps": max_slippage_bps, "pool": pool,
+        })
 
     def refresh_bundle(self, withdraw_position_id, swap_spec, deposit_spec) -> ExecResult:
         self.calls.append({
             "method": "refresh_bundle", "withdraw_position_id": withdraw_position_id,
             "swap_spec": swap_spec, "deposit_spec": deposit_spec,
         })
-        return self._next_result("refresh_bundle")
+        return self._next_result("refresh_bundle", {
+            "withdraw_position_id": withdraw_position_id,
+            "swap_spec": swap_spec, "deposit_spec": deposit_spec,
+        })
 
 
 __all__ = ["ExecResult", "ExecBridge", "FakeExecBridge", "ReplayExecBridge"]

@@ -66,6 +66,10 @@ class KeeperConfig:
     max_history: int = 500              # price history deque size
     sentinel_path: str | None = None   # kill sentinel file path (written by tvl_monitor.py)
     log_dir: str | None = None          # event-log dir; None disables file logging
+    base_mint: str = ""
+    quote_mint: str = ""
+    executor_version: str = ""
+    gas_token_price_quote: float | None = None
 
 
 def dump_keeper_config(cfg: KeeperConfig) -> dict:
@@ -89,6 +93,10 @@ def dump_keeper_config(cfg: KeeperConfig) -> dict:
             "position_id": cfg.position_id,
             "max_history": cfg.max_history,
             "sentinel_path": cfg.sentinel_path,
+            "base_mint": cfg.base_mint,
+            "quote_mint": cfg.quote_mint,
+            "executor_version": cfg.executor_version,
+            "gas_token_price_quote": cfg.gas_token_price_quote,
         },
     }
 
@@ -127,6 +135,10 @@ def rebuild_keeper_config(dump: dict) -> KeeperConfig:
         position_id=k.get("position_id"),
         max_history=k.get("max_history", 500),
         sentinel_path=k.get("sentinel_path"),
+        base_mint=k.get("base_mint", ""),
+        quote_mint=k.get("quote_mint", ""),
+        executor_version=k.get("executor_version", ""),
+        gas_token_price_quote=k.get("gas_token_price_quote"),
     )
 
 
@@ -166,12 +178,17 @@ class Keeper:
         publish: Callable | None = None,
         event_log: EventLog | None = None,
         swap_observer: "SwapObserver | None" = None,
+        sentinel_reader: Callable[[str], tuple[bool, str | None]] | None = None,
+        sentinel_clearer: Callable[[str], None] | None = None,
     ):
         self.cfg = cfg
         self.exec = exec_bridge
         self.publish = publish or (lambda subject, payload: None)
         self.log = event_log
         self.swap_observer = swap_observer
+        self._owns_log = False
+        self._sentinel_reader = sentinel_reader or self._read_sentinel
+        self._sentinel_clearer = sentinel_clearer or os.remove
 
         # Price history for regime/vol estimation
         self._price_history: deque = deque(maxlen=cfg.max_history)
@@ -205,12 +222,36 @@ class Keeper:
 
         # Event-sourcing state (dlmm-logging-plan §1-2)
         self._config_hash: str = hash_keeper_config(cfg)
-        self._run_id: str = ""
+        self._run_id: str = self.log.run_id if self.log is not None else ""
         self._req_counter = 0
         self._last_mid: float | None = None
         self._last_mid_ts: float | None = None
         self._prev_active_bin: int | None = None
         self._last_regime = None
+        self._run_started_emitted = bool(
+            self.log is not None and getattr(self.log, "_seq", 0)
+        )
+        self._run_stopped_emitted = False
+
+        if self.log is None and cfg.log_dir:
+            self._run_id = self._new_run_id()
+            path = os.path.join(cfg.log_dir, f"{self._run_id}.jsonl")
+            self.log = EventLog(path, run_id=self._run_id, config_hash=self._config_hash)
+            self._owns_log = True
+        elif self.log is not None:
+            if not self.log.config_hash:
+                self.log.config_hash = self._config_hash
+            elif self.log.config_hash != self._config_hash:
+                raise ValueError("event-log config_hash does not match KeeperConfig")
+
+        if self.swap_observer is None and self.log is not None:
+            self.swap_observer = SwapObserver(self.log, cfg.grid, cfg.pool_address)
+        if self.swap_observer is not None:
+            self.swap_observer.set_fill_callback(
+                lambda ts, side, price, size: self.markout.on_fill(
+                    ts, side, price, size
+                )
+            )
 
     def emit(self, event_type: str, **fields) -> int:
         """Emit to the event log if one is attached; no-op otherwise."""
@@ -222,30 +263,60 @@ class Keeper:
         self._req_counter += 1
         return f"req_{self._req_counter:06d}"
 
+    @staticmethod
+    def _read_sentinel(path: str) -> tuple[bool, str | None]:
+        if not os.path.exists(path):
+            return False, None
+        with open(path, encoding="utf-8") as fh:
+            return True, fh.read().strip()
+
+    def _finish_cycle(self, record: CycleRecord) -> CycleRecord:
+        """Persist decisions from every exit path, including failures/kills."""
+        self._log_decision(record)
+        return record
+
+    def _ensure_run_started(self) -> None:
+        if self.log is None or self._run_started_emitted:
+            return
+        self._run_id = self._run_id or self.log.run_id or self._new_run_id()
+        self.log.emit(
+            "run_started",
+            config=dump_keeper_config(self.cfg),
+            pool_address=self.cfg.pool_address,
+            base_mint=self.cfg.base_mint,
+            quote_mint=self.cfg.quote_mint,
+            base_decimals=self.cfg.grid.base_decimals,
+            quote_decimals=self.cfg.grid.quote_decimals,
+            dry_run=self.cfg.dry_run,
+            git_sha_dlmm=git_sha(_pkg_dir("dlmm_bot")),
+            git_sha_mm_core=git_sha(_pkg_dir("mm_core")),
+            executor_version=self.cfg.executor_version
+                or type(self.exec).__name__,
+            initial_inventory={
+                "base": self._inventory_base,
+                "quote": self._inventory_quote,
+            },
+        )
+        self._run_started_emitted = True
+
+    def _finalize_log(self, reason: str | None = None) -> None:
+        if self.log is None or self._run_stopped_emitted:
+            return
+        self._ensure_run_started()
+        self.log.emit("run_stopped", reason=reason or self._stop_reason())
+        self._run_stopped_emitted = True
+        if self._owns_log:
+            self.log.close()
+
+    @property
+    def event_log_path(self) -> str | None:
+        return self.log.path if self.log is not None else None
+
     async def run(self, max_cycles: int | None = None) -> None:
         """Main loop. max_cycles=None runs until stopped."""
         self._running = True
         self._run_id = self._run_id or self._new_run_id()
-        if self.log is not None:
-            self.log.emit(
-                "run_started",
-                run_id=self._run_id,
-                config_hash=self._config_hash,
-                config=dump_keeper_config(self.cfg),
-                pool_address=self.cfg.pool_address,
-                base_mint=None,
-                quote_mint=None,
-                base_decimals=self.cfg.grid.base_decimals,
-                quote_decimals=self.cfg.grid.quote_decimals,
-                dry_run=self.cfg.dry_run,
-                git_sha_dlmm=git_sha(_pkg_dir("dlmm_bot")),
-                git_sha_mm_core=git_sha(_pkg_dir("mm_core")),
-                executor_version="ts-bridge",
-                initial_inventory={
-                    "base": self._inventory_base,
-                    "quote": self._inventory_quote,
-                },
-            )
+        self._ensure_run_started()
         logger.info("DLMM keeper started (dry_run=%s)", self.cfg.dry_run)
         try:
             while self._running:
@@ -258,31 +329,31 @@ class Keeper:
                     break
                 await asyncio.sleep(self.cfg.refresh_interval)
         finally:
-            if self.log is not None:
-                self.log.emit("run_stopped", reason=self._stop_reason())
+            self._finalize_log()
 
     def _new_run_id(self) -> str:
-        return f"run_{self.cfg.pool_address or 'pool'}_{int(time.time() * 1000)}"
+        return f"run_{self.cfg.pool_address or 'pool'}_{time.time_ns()}"
 
     def _stop_reason(self) -> str:
         return "halted" if self._halted else "stop"
 
     def stop(self):
         self._running = False
+        self._finalize_log()
 
     async def _cycle(self) -> CycleRecord:
         """One poll→evaluate→actuate cycle."""
+        self._ensure_run_started()
         ts = time.time()
         if self.log is not None:
             self.log.set_cycle(self._cycle_count)
 
         # 0. Sentinel kill-switch (written by tvl_monitor.py) — now loggable
         if self.cfg.sentinel_path:
-            sentinel_exists = os.path.exists(self.cfg.sentinel_path)
-            sentinel_reason: str | None = None
+            sentinel_exists, sentinel_reason = self._sentinel_reader(
+                self.cfg.sentinel_path
+            )
             if sentinel_exists:
-                with open(self.cfg.sentinel_path) as f:
-                    sentinel_reason = f.read().strip()
                 logger.critical("Sentinel kill: %s", sentinel_reason)
             self.emit(
                 "sentinel_check",
@@ -292,11 +363,11 @@ class Keeper:
             )
             if sentinel_exists:
                 await self._emergency_exit()
-                os.remove(self.cfg.sentinel_path)
-                return self._make_record(
+                self._sentinel_clearer(self.cfg.sentinel_path)
+                return self._finish_cycle(self._make_record(
                     ts, Decision.EMERGENCY_EXIT, "emergency", "sentinel_kill",
                     refresh_reason=sentinel_reason,
-                )
+                ))
 
         # 1. Poll state
         state_result = self.exec.get_state(self.cfg.pool_address)
@@ -306,7 +377,9 @@ class Keeper:
                 "state_observation", ts=ts, state=None, ok=False,
                 error=state_result.error, mid=None,
             )
-            return self._make_record(ts, Decision.STOP_QUOTING, "error", "no_state")
+            return self._finish_cycle(
+                self._make_record(ts, Decision.STOP_QUOTING, "error", "no_state")
+            )
 
         state = state_result.data
         self._active_bin = state.get("active_bin", state.get("activeBin", 0))
@@ -318,12 +391,13 @@ class Keeper:
         self._price_history.append(mid)
         self._ts_history.append(ts)
         self.pnl.mark(ts, mid)
-        self.emit(
+        obs_seq = self.emit(
             "state_observation",
             ts=ts,  # explicit cycle ts → deterministic replay clock freeze
             state=_jsonable(state),
             active_bin=self._active_bin,
-            balances=balances,
+            balances=_jsonable(balances),
+            balances_raw=_jsonable(state.get("balances_raw")),
             tvl_usd=state.get("tvl_usd"),
             mid=mid,
         )
@@ -338,20 +412,27 @@ class Keeper:
                 mid_before=self.cfg.grid.price_from_bin(self._prev_active_bin),
                 mid_after=mid,
                 source="poll",
+                obs_seq=obs_seq,
             )
         self._prev_active_bin = self._active_bin
 
         # Per-cycle position observation (dlmm-logging-plan §4)
         if self._current_position_id is not None:
             pos_result = self.exec.get_position(self._current_position_id)
-            if pos_result.ok and pos_result.data is not None:
-                self.emit(
-                    "position_observation",
-                    position_id=self._current_position_id,
-                    data=_jsonable(pos_result.data),
-                    claimable_fee_x=pos_result.data.get("claimable_fee_x"),
-                    claimable_fee_y=pos_result.data.get("claimable_fee_y"),
-                )
+            pos_data = pos_result.data if isinstance(pos_result.data, dict) else {}
+            self.emit(
+                "position_observation",
+                position_id=self._current_position_id,
+                ok=pos_result.ok,
+                error=pos_result.error,
+                data=_jsonable(pos_result.data),
+                active_bin=pos_data.get("active_bin", self._active_bin),
+                bins=_jsonable(pos_data.get("bins", [])),
+                claimable_fee_x=pos_data.get("claimable_fee_x"),
+                claimable_fee_y=pos_data.get("claimable_fee_y"),
+                claimable_fee_x_raw=pos_data.get("claimable_fee_x_raw"),
+                claimable_fee_y_raw=pos_data.get("claimable_fee_y_raw"),
+            )
 
         self._last_mid, self._last_mid_ts = mid, ts
         if self.swap_observer is not None:
@@ -366,10 +447,10 @@ class Keeper:
         if kill:
             logger.critical("Rug kill-switch: %s", kill_reason)
             await self._emergency_exit()
-            return self._make_record(
+            return self._finish_cycle(self._make_record(
                 ts, Decision.EMERGENCY_EXIT, "emergency", "rug_kill_switch",
                 mid=mid, refresh_reason=kill_reason,
-            )
+            ))
 
         inv_cap_breached, inv_reason = self.dlmm_risk.check_inventory_cap(
             self._inventory_base,
@@ -379,10 +460,10 @@ class Keeper:
         if inv_cap_breached:
             logger.warning("Inventory cap breached: %s", inv_reason)
             await self._de_risk()
-            return self._make_record(
+            return self._finish_cycle(self._make_record(
                 ts, Decision.DE_RISK, "normal", "inventory_cap",
                 mid=mid, refresh_reason=inv_reason,
-            )
+            ))
 
         # 3. Regime + AS + shared risk policy
         price_history = list(zip(self._ts_history, self._price_history))
@@ -523,64 +604,97 @@ class Keeper:
     def _emit_action(self, req_id: str, verb: str, payload: dict) -> None:
         self.emit("action_request", req_id=req_id, verb=verb, payload=_jsonable(payload))
 
-    def _emit_result(self, req_id: str, verb: str, result: ExecResult) -> None:
-        """Correlate request→result (req_id) and result→chain (tx_signature)."""
+    def _chain_fields(self, result: ExecResult) -> dict:
+        signatures = list(result.tx_signatures)
+        return {
+            "tx_signature": signatures[0] if len(signatures) == 1 else None,
+            "tx_signatures": signatures,
+            "transactions": _jsonable(result.tx_receipts),
+            "slot": result.slot,
+            "block_time": result.block_time,
+            "fee_lamports": result.total_fee_lamports,
+            "compute_unit_price": result.compute_unit_price,
+        }
+
+    def _emit_result(
+        self, req_id: str, verb: str, result: ExecResult, gas_label: str
+    ) -> None:
+        """Correlate request→result and persist every transaction receipt."""
         self.emit(
             "action_result",
             req_id=req_id,
             verb=verb,
             ok=result.ok,
             error=result.error,
-            tx_signatures=list(result.tx_signatures),
             position_id=(result.data.get("position_id") if isinstance(result.data, dict) else None)
             or result.position_id,
-            slot=result.slot,
-            block_time=result.block_time,
-            fee_lamports=result.fee_lamports,
-            compute_unit_price=result.compute_unit_price,
             data=_jsonable(result.data),
+            **self._chain_fields(result),
         )
+        self._gas(gas_label, result)
 
-    def _gas(self, label: str, result: ExecResult | None) -> None:
-        """Book gas as a PnL cost + emit a cash_flow event. Uses the actual
-        fee from the tx receipt when the executor reports one, else the
-        constant placeholder."""
+    def _gas(self, label: str, result: ExecResult) -> None:
+        """Record gas in native and quote units for every submitted action."""
+        actual_fee = result.total_fee_lamports
+        if actual_fee is None and not (result.ok or result.tx_signatures):
+            return
         fee_lamports = (
-            result.fee_lamports if result is not None and result.fee_lamports
-            else None
-        ) or REFRESH_GAS_LAMPORTS
+            actual_fee if actual_fee is not None else REFRESH_GAS_LAMPORTS
+        )
+        amount_sol = -fee_lamports / 1e9
+        native_price = self.cfg.gas_token_price_quote
+        if native_price is None:
+            native_price = self._last_mid
+        amount_quote = amount_sol * native_price if native_price is not None else None
         ts = time.time()
-        self.pnl.on_cash_flow("rebalance", ts, -fee_lamports / 1e9, label=label)
+        if amount_quote is not None:
+            self.pnl.on_cash_flow("rebalance", ts, amount_quote, label=label)
         self.emit(
             "cash_flow",
             label=label,
             ts=ts,
-            amount_sol=-fee_lamports / 1e9,
+            amount_sol=amount_sol,
+            amount_quote=amount_quote,
             fee_lamports=fee_lamports,
-            actual_fee=result is not None and result.fee_lamports is not None,
-            tx_signatures=list(result.tx_signatures) if result is not None else [],
+            actual_fee=actual_fee is not None,
+            tx_signatures=list(result.tx_signatures),
+            transactions=_jsonable(result.tx_receipts),
         )
 
     def _bin_payload(self, levels: list[LadderLevel]) -> list[dict]:
-        return [
-            {
-                "bin_id": l.bin_id,
-                "side": l.side,
-                "amount": l.size,
-                "price": self.cfg.grid.price_from_bin(l.bin_id),
-            }
-            for l in levels
-        ]
+        rows = []
+        for level in levels:
+            is_ask = level.side == "ask"
+            amount_base = level.size if is_ask else 0.0
+            amount_quote = 0.0 if is_ask else level.size
+            rows.append({
+                "bin_id": level.bin_id,
+                "side": level.side,
+                "amount": level.size,  # legacy bridge amount
+                "amount_base": amount_base,
+                "amount_quote": amount_quote,
+                "amount_base_raw": self.cfg.grid.to_raw(amount_base, "base"),
+                "amount_quote_raw": self.cfg.grid.to_raw(amount_quote, "quote"),
+                "price": self.cfg.grid.price_from_bin(level.bin_id),
+            })
+        return rows
+
+    def _register_ladder(self, ladder: list[LadderLevel], position_id: str | None) -> None:
+        if self.swap_observer is None:
+            return
+        self.swap_observer.register_ladder(
+            {row["bin_id"]: row for row in self._bin_payload(ladder)},
+            position_id,
+        )
 
     async def _deposit_ladder(self, ladder: list[LadderLevel]) -> None:
         """Initial deposit of single-sided positions."""
+        self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would deposit %d levels", len(ladder))
             return
         bids = [l for l in ladder if l.side == "bid"]
         asks = [l for l in ladder if l.side == "ask"]
-        results: list[ExecResult] = []
-
         # Deposit bid side (quote token below mid)
         if bids:
             req_id = self._next_req_id()
@@ -593,8 +707,7 @@ class Keeper:
             }
             self._emit_action(req_id, "deposit_single_sided", payload)
             result = self.exec.deposit_single_sided(**payload)
-            self._emit_result(req_id, "deposit_single_sided", result)
-            results.append(result)
+            self._emit_result(req_id, "deposit_single_sided", result, "deposit_gas")
             if result.ok:
                 self._current_position_id = (
                     result.data.get("position_id") if result.data else None
@@ -605,11 +718,11 @@ class Keeper:
                 self.emit(
                     "position_created",
                     position_id=self._current_position_id,
-                    tx_signatures=list(result.tx_signatures),
                     min_bin_id=min(l.bin_id for l in bids),
                     max_bin_id=max(l.bin_id for l in bids),
                     bins=self._bin_payload(bids),
                     strategy_type="Spot",
+                    **self._chain_fields(result),
                 )
                 logger.info("Deposited bid side: %s", result.tx_signatures)
             else:
@@ -627,31 +740,25 @@ class Keeper:
             }
             self._emit_action(req_id, "deposit_single_sided", payload)
             result = self.exec.deposit_single_sided(**payload)
-            self._emit_result(req_id, "deposit_single_sided", result)
-            results.append(result)
+            self._emit_result(req_id, "deposit_single_sided", result, "deposit_gas")
             if result.ok:
                 self.emit(
                     "position_liquidity_added",
                     position_id=self._current_position_id,
-                    tx_signatures=list(result.tx_signatures),
                     min_bin_id=min(l.bin_id for l in asks),
                     max_bin_id=max(l.bin_id for l in asks),
                     bins=self._bin_payload(asks),
                     strategy_type="Spot",
+                    **self._chain_fields(result),
                 )
             else:
                 logger.error("Ask deposit failed: %s", result.error)
 
-        # Gas as PnL cost
-        self._gas("deposit_gas", results[-1] if results else None)
-
-        if self.swap_observer is not None:
-            self.swap_observer.register_ladder(
-                {l.bin_id: l.size for l in ladder}, self._current_position_id
-            )
+        self._register_ladder(ladder, self._current_position_id)
 
     async def _refresh_ladder(self, ladder: list[LadderLevel]) -> None:
         """Refresh: withdraw → optional swap → redeposit via Jito bundle."""
+        self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would refresh %d levels", len(ladder))
             return
@@ -676,7 +783,7 @@ class Keeper:
         }
         self._emit_action(req_id, "refresh_bundle", payload)
         result = self.exec.refresh_bundle(**payload)
-        self._emit_result(req_id, "refresh_bundle", result)
+        self._emit_result(req_id, "refresh_bundle", result, "refresh_gas")
         if result.ok:
             center = min(l.bin_id for l in ladder if l.side == "bid") if bids else self._active_bin
             self._center_bin = center
@@ -689,31 +796,25 @@ class Keeper:
                 "position_withdrawn",
                 position_id=old_pid,
                 bps=100,
-                tx_signatures=list(result.tx_signatures),
                 fees_claimed=data.get("fees_claimed"),
                 amounts_returned=data.get("amounts_returned"),
+                **self._chain_fields(result),
             )
             self.emit(
                 "position_liquidity_added",
                 position_id=new_pid,
-                tx_signatures=list(result.tx_signatures),
-                bins=[
-                    {"bin_id": l.bin_id, "side": l.side, "amount": l.size, "price": None}
-                    for l in ladder
-                ],
+                bins=self._bin_payload(ladder),
+                **self._chain_fields(result),
             )
-            if self.swap_observer is not None:
-                self.swap_observer.register_ladder(
-                    {l.bin_id: l.size for l in ladder}, new_pid
-                )
+            self._register_ladder(ladder, new_pid)
             logger.info("Refreshed ladder: %s", result.tx_signatures)
         else:
             logger.error("Refresh failed: %s", result.error)
 
-        self._gas("refresh_gas", result)
 
     async def _stop_quoting(self) -> None:
         """Stop quoting: withdraw to single-sided safe leg."""
+        self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would stop quoting (withdraw to safe leg)")
             return
@@ -722,16 +823,16 @@ class Keeper:
             payload = {"position_id": self._current_position_id, "bps": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
-            self._emit_result(req_id, "withdraw", result)
+            self._emit_result(req_id, "withdraw", result, "stop_quoting_gas")
             data = result.data if isinstance(result.data, dict) else {}
             if result.ok:
                 self.emit(
                     "position_withdrawn",
                     position_id=self._current_position_id,
                     bps=100,
-                    tx_signatures=list(result.tx_signatures),
                     fees_claimed=data.get("fees_claimed"),
                     amounts_returned=data.get("amounts_returned"),
+                    **self._chain_fields(result),
                 )
                 logger.info("Stopped quoting: withdrew position %s", self._current_position_id)
                 self._current_position_id = None
@@ -742,6 +843,7 @@ class Keeper:
 
     async def _de_risk(self) -> None:
         """De-risk: stop bids, drain asks, TWAP remainder over Jupiter."""
+        self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would de-risk (stop bids, drain asks, TWAP)")
             return
@@ -751,7 +853,7 @@ class Keeper:
             payload = {"position_id": self._current_position_id, "bps": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
-            self._emit_result(req_id, "withdraw", result)
+            self._emit_result(req_id, "withdraw", result, "de_risk_withdraw")
             data = result.data if isinstance(result.data, dict) else {}
             if not result.ok:
                 logger.error("De-risk withdraw failed: %s", result.error)
@@ -760,14 +862,13 @@ class Keeper:
                 "position_withdrawn",
                 position_id=self._current_position_id,
                 bps=100,
-                tx_signatures=list(result.tx_signatures),
                 fees_claimed=data.get("fees_claimed"),
                 amounts_returned=data.get("amounts_returned"),
+                **self._chain_fields(result),
             )
             self._current_position_id = None
             if self.swap_observer is not None:
                 self.swap_observer.clear()
-            self._gas("de_risk_withdraw", result)
 
         # Step 2: TWAP the remainder via Jupiter swap
         # In production, this would chunk the remaining inventory into N
@@ -783,15 +884,15 @@ class Keeper:
             }
             self._emit_action(req_id, "swap", payload)
             result = self.exec.swap(**payload)
-            self._emit_result(req_id, "swap", result)
+            self._emit_result(req_id, "swap", result, "de_risk_swap")
             if result.ok:
                 logger.info("De-risk swap executed: %s", result.tx_signatures)
-                self._gas("de_risk_swap", result)
             else:
                 logger.error("De-risk swap failed: %s", result.error)
 
     async def _emergency_exit(self) -> None:
         """Emergency exit: Jito bundle withdraw all + swap to safe leg."""
+        self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] EMERGENCY EXIT — would Jito bundle withdraw + swap")
             self._halted = True
@@ -802,7 +903,7 @@ class Keeper:
             payload = {"position_id": self._current_position_id, "bps": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
-            self._emit_result(req_id, "withdraw", result)
+            self._emit_result(req_id, "withdraw", result, "emergency_withdraw")
             data = result.data if isinstance(result.data, dict) else {}
             if not result.ok:
                 logger.critical("Emergency withdraw FAILED: %s", result.error)
@@ -810,9 +911,9 @@ class Keeper:
                 self.emit(
                     "position_closed",
                     position_id=self._current_position_id,
-                    tx_signatures=list(result.tx_signatures),
                     fees_claimed=data.get("fees_claimed"),
                     amounts_returned=data.get("amounts_returned"),
+                    **self._chain_fields(result),
                 )
                 logger.critical("Emergency withdraw ok: %s", result.tx_signatures)
             self._current_position_id = None
@@ -830,7 +931,7 @@ class Keeper:
             }
             self._emit_action(req_id, "swap", payload)
             result = self.exec.swap(**payload)
-            self._emit_result(req_id, "swap", result)
+            self._emit_result(req_id, "swap", result, "emergency_swap")
             if result.ok:
                 logger.critical("Emergency swap ok: %s", result.tx_signatures)
             else:

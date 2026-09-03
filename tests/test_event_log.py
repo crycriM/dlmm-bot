@@ -59,6 +59,35 @@ class TestEventLog:
             expect = hashlib.sha256((lines[i - 1] + "\n").encode()).hexdigest()
             assert recs[i]["prev_hash"] == expect
 
+    def test_nonempty_log_requires_explicit_resume(self, tmp_path):
+        path = str(tmp_path / "run.jsonl")
+        with EventLog(path, run_id="r", config_hash="h") as log:
+            log.emit("a")
+
+        with pytest.raises(FileExistsError):
+            EventLog(path, run_id="r", config_hash="h")
+
+        with EventLog(path, run_id="r", config_hash="h", resume=True) as log:
+            assert log.emit("b") == 2
+
+        assert [e["seq"] for e in ReplayLog(path)] == [1, 2]
+
+    def test_completed_run_cannot_be_resumed(self, tmp_path):
+        path = str(tmp_path / "run.jsonl")
+        with EventLog(path, run_id="r", config_hash="h") as log:
+            log.emit("run_started")
+            log.emit("run_stopped", reason="stop")
+        with pytest.raises(ValueError, match="completed"):
+            EventLog(path, run_id="r", config_hash="h", resume=True)
+
+    def test_payload_cannot_override_envelope(self, tmp_path):
+        path = str(tmp_path / "run.jsonl")
+        with EventLog(path, run_id="r", config_hash="h") as log:
+            log.emit("real", seq=99, run_id="spoofed")
+        event = ReplayLog(path).events()[0]
+        assert event["seq"] == 1
+        assert event["run_id"] == "r"
+
     def test_jsonable_replaces_non_finite(self):
         assert _jsonable(float("inf")) is None
         assert _jsonable(float("-nan")) is None
@@ -93,6 +122,20 @@ class TestReplayLog:
         with pytest.raises(ValueError):
             ReplayLog(path)
 
+    def test_detects_missing_hash_link(self, tmp_path):
+        path = str(tmp_path / "run.jsonl")
+        with EventLog(path) as log:
+            log.emit("a")
+            log.emit("b")
+        lines = open(path).read().splitlines()
+        second = json.loads(lines[1])
+        second.pop("prev_hash")
+        open(path, "w").write(
+            lines[0] + "\n" + json.dumps(second, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        with pytest.raises(ValueError):
+            ReplayLog(path)
+
     def test_by_type_and_run_started(self, tmp_path):
         path = str(tmp_path / "run.jsonl")
         with EventLog(path, run_id="r") as log:
@@ -122,7 +165,7 @@ class TestToBinEvents:
         b = next(b for b in bts if (b.prev_active_bin, b.active_bin) == (100, 103))
         assert b.trade_size_usd == 100.0
 
-    def test_poll_only(self):
+    def test_poll_only_is_not_converted_to_a_trade(self):
         evs = [
             {"event_type": "run_started", "pool_address": "p"},
             {"event_type": "state_observation", "tvl_usd": 42, "ts": 1.0},
@@ -130,9 +173,7 @@ class TestToBinEvents:
              "direction": "up", "ts_wall": 2.0},
         ]
         bts = to_bin_events(evs)
-        assert len(bts) == 1
-        assert bts[0].tvl_usd == 42
-        assert bts[0].trade_size_usd == 0.0
+        assert bts == []
 
 
 class TestConfigRoundTrip:

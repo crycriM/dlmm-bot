@@ -4,8 +4,8 @@ Append-only, event-sourced JSONL log for a dlmm-bot run.
 Design (docs/dlmm-logging-plan.md §1):
 - one JSONL file per run: every record carries seq (monotonic, gap-free),
   run_id, schema_version, event_type, ts_wall, cycle, config_hash
-- single writer: emit() is a synchronous append called from the (single)
-  keeper event loop — swap-stream and cycle events share one total order
+- serialized writer: emit() is guarded by one process-local lock, so keeper
+  cycle and swap-stream events share one total order
 - tamper-evidence: prev_hash = sha256(previous line bytes), making the log
   a self-certifying hash chain for audits
 - ReplayLog reads a recorded log back for rerun/verify/explain readers
@@ -22,10 +22,11 @@ import json
 import math
 import os
 import subprocess
+import threading
 import time
 from typing import Any, Iterable, Iterator, Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _jsonable(obj: Any) -> Any:
@@ -72,6 +73,7 @@ class EventLog:
         run_id: str | None = None,
         config_hash: str = "",
         schema_version: int = SCHEMA_VERSION,
+        resume: bool = False,
     ):
         self.path = path
         self.run_id = run_id or os.path.splitext(os.path.basename(path))[0]
@@ -80,40 +82,70 @@ class EventLog:
         self._seq = 0
         self._cycle = 0
         self._prev_line: str | None = None
+        self._lock = threading.RLock()
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
+
+        nonempty = os.path.exists(path) and os.path.getsize(path) > 0
+        if nonempty and not resume:
+            raise FileExistsError(
+                f"event log already exists: {path}; pass resume=True to append"
+            )
+        if nonempty:
+            prior = ReplayLog(path)
+            last = prior.events()[-1]
+            if last.get("event_type") == "run_stopped":
+                raise ValueError("cannot resume a completed event-log run")
+            prior_run_id = str(last.get("run_id", ""))
+            prior_config_hash = str(last.get("config_hash", ""))
+            if run_id is not None and prior_run_id != run_id:
+                raise ValueError("run_id does not match existing event log")
+            if config_hash and prior_config_hash != config_hash:
+                raise ValueError("config_hash does not match existing event log")
+            if int(last.get("schema_version")) != schema_version:
+                raise ValueError("schema_version does not match existing event log")
+            self.run_id = prior_run_id
+            self.config_hash = prior_config_hash
+            self._seq = int(last["seq"])
+            self._cycle = int(last.get("cycle", 0))
+            with open(path, "r", encoding="utf-8") as existing:
+                lines = [line.rstrip("\n") for line in existing if line.strip()]
+            self._prev_line = lines[-1]
         self._fh = open(path, "a", encoding="utf-8")
 
     def set_cycle(self, cycle: int) -> None:
-        self._cycle = cycle
+        with self._lock:
+            self._cycle = cycle
 
     def emit(self, event_type: str, **fields: Any) -> int:
         """Append one event, return its seq. Sync: call from the event loop."""
-        self._seq += 1
-        prev_hash = (
-            hashlib.sha256((self._prev_line + "\n").encode("utf-8")).hexdigest()
-            if self._prev_line is not None else ""
-        )
-        record = {
-            "event_type": event_type,
-            "prev_hash": prev_hash,
-            "run_id": self.run_id,
-            "schema_version": self.schema_version,
-            "ts_wall": time.time(),
-            "config_hash": self.config_hash,
-            "cycle": self._cycle,
-            "seq": self._seq,
-            **_jsonable(fields),
-        }
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"))
-        self._fh.write(line + "\n")
-        self._fh.flush()
-        self._prev_line = line
-        return record["seq"]
+        with self._lock:
+            self._seq += 1
+            prev_hash = (
+                hashlib.sha256((self._prev_line + "\n").encode("utf-8")).hexdigest()
+                if self._prev_line is not None else ""
+            )
+            record = {
+                **_jsonable(fields),
+                "event_type": event_type,
+                "prev_hash": prev_hash,
+                "run_id": self.run_id,
+                "schema_version": self.schema_version,
+                "ts_wall": time.time(),
+                "config_hash": self.config_hash,
+                "cycle": self._cycle,
+                "seq": self._seq,
+            }
+            line = json.dumps(record, sort_keys=True, separators=(",", ":"))
+            self._fh.write(line + "\n")
+            self._fh.flush()
+            self._prev_line = line
+            return record["seq"]
 
     def close(self) -> None:
-        if self._fh and not self._fh.closed:
-            self._fh.close()
+        with self._lock:
+            if self._fh and not self._fh.closed:
+                self._fh.close()
 
     def __enter__(self) -> "EventLog":
         return self
@@ -138,12 +170,21 @@ class ReplayLog:
                 if not line:
                     continue
                 rec = json.loads(line)
-                if rec.get("seq") is not None and rec["seq"] != len(self._events) + 1:
-                    raise ValueError(f"seq gap at line {lineno + 1}: {rec['seq']}")
-                if prev_line is not None:
+                if rec.get("seq") != len(self._events) + 1:
+                    raise ValueError(
+                        f"seq gap at line {lineno + 1}: {rec.get('seq')}"
+                    )
+                if prev_line is None:
+                    if rec.get("prev_hash") != "":
+                        raise ValueError("first event must have an empty prev_hash")
+                else:
                     expect = hashlib.sha256((prev_line + "\n").encode("utf-8")).hexdigest()
-                    if rec.get("prev_hash") not in (expect, None):
+                    if rec.get("prev_hash") != expect:
                         raise ValueError(f"hash chain broken at line {lineno + 1}")
+                    first = self._events[0]
+                    for key in ("run_id", "schema_version", "config_hash"):
+                        if rec.get(key) != first.get(key):
+                            raise ValueError(f"{key} changed at line {lineno + 1}")
                 self._events.append(rec)
                 prev_line = line
 
@@ -184,9 +225,9 @@ def to_bin_events(
     backtester's fields: ts, pool, active/prev bin, direction,
     trade_size_usd, fee_bps, tvl_usd).
 
-    Swap-derived ``observed_trade`` events take precedence over poll-derived
-    ``price_change`` events with the same (prev, new) bin move — the poll
-    event is a coarse sample of the same crossing.
+    Only decoded ``observed_trade`` events are converted. Poll-derived active
+    bin changes contain no trade size and cannot be represented losslessly as
+    backtest fills.
     """
     from dlmm_bot.backtest import BinEvent
 
@@ -194,11 +235,6 @@ def to_bin_events(
     start = next((e for e in evs if e.get("event_type") == "run_started"), None)
     pool = (start or {}).get("pool_address", "")
 
-    trades = [e for e in evs if e.get("event_type") == "observed_trade"]
-    polls = [e for e in evs if e.get("event_type") == "price_change"]
-    swap_pairs = {
-        (e.get("prev_active_bin"), e.get("new_active_bin")) for e in trades
-    }
     last_tvl: float | None = None
     last_fee = default_fee_bps
 
@@ -224,20 +260,6 @@ def to_bin_events(
                     "trade_size_usd": e.get("trade_size_usd", 0.0),
                     "fee_bps": last_fee,
                     "tvl_usd": e.get("tvl_usd", last_tvl),
-                },
-            ))
-        elif t == "price_change" and (e.get("prev_active_bin"), e.get("new_active_bin")) not in swap_pairs:
-            rows.append((
-                float(e.get("ts_wall") or 0.0),
-                1,
-                {
-                    "pool": pool,
-                    "active_bin": e.get("new_active_bin", 0),
-                    "prev_active_bin": e.get("prev_active_bin", 0),
-                    "direction": e.get("direction", "up"),
-                    "trade_size_usd": 0.0,
-                    "fee_bps": last_fee,
-                    "tvl_usd": last_tvl,
                 },
             ))
 

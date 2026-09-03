@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 
@@ -11,7 +12,7 @@ from dlmm_bot.backtest import BinEvent, DLMMBacktester
 from dlmm_bot.config import DLMMConfig
 from dlmm_bot.event_log import EventLog, load_events
 from dlmm_bot.grid import VenueGrid
-from dlmm_bot.swap_observer import SwapObserver
+from dlmm_bot.swap_observer import SwapObserver, SwapStreamRunner
 
 
 @pytest.fixture
@@ -127,3 +128,63 @@ class TestBacktesterParity:
         assert bt_fills == obs_fills
         assert {b for b, _, _ in obs_fills} == {99, 100, 101}
         assert bt.n_fills == 3
+
+
+def test_rich_bid_liquidity_keeps_quote_and_base_units(grid, log):
+    observer = SwapObserver(log, grid, "p")
+    price = grid.price_from_bin(99)
+    observer.register_ladder({
+        99: {
+            "side": "bid",
+            "amount_base": 0.0,
+            "amount_quote": 200.0,
+            "amount_quote_raw": 200_000_000_000,
+        },
+    }, position_id="P")
+    observer.on_swap({
+        "tx_signature": "S",
+        "slot": 7,
+        "block_time": 8,
+        "prev_active_bin": 100,
+        "new_active_bin": 98,
+        "direction": "down",
+        "bins_crossed": [{"bin_id": 99, "amount_x_raw": 123}],
+    }, ts=2.0)
+    fill = _fills(log)[0]
+    assert fill["amount_quote"] == pytest.approx(200.0)
+    assert fill["amount_base"] == pytest.approx(200.0 / price)
+    assert fill["amount_quote_raw"] == 200_000_000_000
+    trade = [e for e in load_events(log.path) if e["event_type"] == "observed_trade"][0]
+    assert trade["bins_crossed"] == [
+        {"bin_id": 99, "amount_x_raw": 123, "bin_price": price},
+        {"bin_id": 100, "bin_price": grid.price_from_bin(100)},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stream_runner_backfills_before_subscribe(grid, log):
+    class Source:
+        async def backfill(self, pool, after_signature):
+            return [{
+                "tx_signature": "BACKFILL", "prev_active_bin": 100,
+                "new_active_bin": 101,
+            }]
+
+        async def subscribe(self, pool):
+            yield {
+                "tx_signature": "LIVE", "prev_active_bin": 101,
+                "new_active_bin": 102,
+            }
+            await asyncio.Event().wait()
+
+    runner = SwapStreamRunner(SwapObserver(log, grid, "p"), Source())
+    task = runner.start()
+    for _ in range(20):
+        trades = [e for e in load_events(log.path) if e["event_type"] == "observed_trade"]
+        if len(trades) == 2:
+            break
+        await asyncio.sleep(0)
+    runner.stop()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [t["tx_signature"] for t in trades] == ["BACKFILL", "LIVE"]

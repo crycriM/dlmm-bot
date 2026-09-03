@@ -6,6 +6,8 @@ function of the folded facts, so this isolates the accounting math.
 
 from __future__ import annotations
 
+import pytest
+
 from dlmm_bot.pnl_explain import explain_run
 
 
@@ -144,6 +146,43 @@ class TestFees:
         assert abs(r.lp_fee_divergence) < 1e-6
         assert not r.fee_divergence_flagged
         assert r.flags == []
+        assert abs(r.total_pnl - 30.5) < ZERO
+
+    def test_first_observation_accrues_from_position_creation(self):
+        evs = [
+            _ev("run_started", 0.0, base_decimals=6, quote_decimals=6),
+            _ev("state_observation", 0.0, mid=100.0),
+            _ev("position_created", 0.5, position_id="P", bins=[]),
+            _ev("position_observation", 1.0, position_id="P",
+                claimable_fee_x_raw=100_000, claimable_fee_y_raw=1_000_000),
+        ]
+        r = explain_run(evs)
+        assert r.lp_fee_accrued == pytest.approx(11.0)
+        assert r.total_pnl == pytest.approx(11.0)
+
+    def test_claims_without_observations_do_not_raise_false_divergence(self):
+        evs = [
+            _ev("state_observation", 0.0, mid=100.0),
+            _ev("position_closed", 1.0, position_id="P",
+                fees_claimed={"x": 0.1, "y": 1.0}),
+        ]
+        r = explain_run(evs)
+        assert r.lp_fee_claimed == pytest.approx(11.0)
+        assert r.total_pnl == pytest.approx(11.0)
+        assert not r.fee_divergence_flagged
+
+    def test_raw_claimable_fees_use_logged_decimals(self):
+        evs = [
+            _ev("run_started", 0.0, base_decimals=6, quote_decimals=6),
+            _ev("state_observation", 0.0, mid=100.0),
+            _ev("position_observation", 1.0, position_id="P",
+                claimable_fee_x_raw=1_000_000, claimable_fee_y_raw=2_000_000),
+            _ev("position_observation", 2.0, position_id="P",
+                claimable_fee_x_raw=1_500_000, claimable_fee_y_raw=2_500_000),
+        ]
+        r = explain_run(evs)
+        assert r.lp_fee_accrued == pytest.approx(50.5)
+        assert r.total_pnl == pytest.approx(50.5)
 
 
 class TestCosts:
@@ -152,13 +191,14 @@ class TestCosts:
             _ev("state_observation", 0.0, mid=150.0),
             _ev("action_result", 1.0, verb="refresh_bundle", ok=True,
                 fee_lamports=50000, tx_signatures=["T"]),
-            _ev("cash_flow", 1.0, label="refresh_gas", amount_sol=-50000 / 1e9),
+            _ev("cash_flow", 1.0, label="refresh_gas", amount_sol=-50000 / 1e9,
+                amount_quote=-0.0075),
         ]
         r = explain_run(evs)
         assert r.gas_lamports == 50000
         assert abs(r.gas_sol - 5e-5) < 1e-18
-        assert abs(r.rebalance_cost - (-5e-5)) < 1e-18
-        assert abs(r.total_pnl - (-5e-5)) < 1e-18
+        assert abs(r.rebalance_cost - (-0.0075)) < 1e-18
+        assert abs(r.total_pnl - (-0.0075)) < 1e-18
 
     def test_claims_route_to_lp_fee_channel(self):
         evs = [
@@ -177,6 +217,8 @@ class TestCosts:
         r = explain_run(base)
         # 10 base @ mid = 1500 USD in vs 1490 quote out → 10 USD slippage
         assert abs(r.swap_slippage - 10.0) < ZERO
+        assert r.rebalance_cost == pytest.approx(-10.0)
+        assert r.total_pnl == pytest.approx(-10.0)
 
         at_mid = list(base)
         at_mid[1] = _ev("action_result", 1.0, verb="swap", ok=True, fee_lamports=0,

@@ -5,6 +5,7 @@ import pytest
 from dlmm_bot.keeper import Keeper, KeeperConfig, CycleRecord
 from dlmm_bot.config import DLMMConfig
 from dlmm_bot.grid import VenueGrid
+from dlmm_bot.event_log import ReplayLog
 from dlmm_bot.exec_bridge import FakeExecBridge
 from dlmm_bot.risk_dlmm import PairType
 
@@ -45,6 +46,23 @@ class TestKeeperInit:
     def test_components_initialized(self, keeper):
         assert keeper.risk_policy is not None
         assert keeper.dlmm_risk is not None
+
+    def test_log_dir_creates_owned_event_log(self, cfg, bridge, tmp_path):
+        cfg.log_dir = str(tmp_path)
+        keeper = Keeper(cfg, bridge)
+        bridge.set_state(
+            cfg.pool_address,
+            active_bin=100,
+            balances={"base": 1.0, "quote": 100.0},
+            tvl_usd=50_000,
+        )
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(keeper._cycle())
+        loop.close()
+        keeper.stop()
+        paths = list(tmp_path.glob("*.jsonl"))
+        assert len(paths) == 1
+        assert ReplayLog(str(paths[0])).events()[-1]["event_type"] == "run_stopped"
         assert keeper.markout is not None
         assert keeper.pnl is not None
         assert keeper._halted is False
@@ -85,7 +103,9 @@ class TestKeeperCycle:
         loop.close()
         # With 0 price history, regime eval may fail — but the ladder
         # should still attempt deposit if state is available
-        assert record.action in ("initial_deposit", "hold", "no_state", "error")
+        assert record.action in (
+            "initial_deposit", "hold", "stop_quoting", "no_state", "error"
+        )
 
     def test_dry_run_does_not_send_tx(self, keeper, bridge):
         """In dry_run mode, no deposit/withdraw should be sent."""
@@ -117,7 +137,7 @@ class TestKeeperRunWithCycles:
         record = loop.run_until_complete(keeper._cycle())
         loop.close()
         assert record.decision == "emergency_exit"
-        assert record.action in ("emergency_exit", "no_state")
+        assert record.action == "rug_kill_switch"
 
 
 class TestKeeperHedge:

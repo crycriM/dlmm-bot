@@ -50,6 +50,7 @@ class ReplayReport:
     config_hash_ok: bool = False
     n_decisions: int = 0
     n_actions: int = 0
+    n_swaps: int = 0
     decision_diffs: list[dict] = field(default_factory=list)
     action_diffs: list[dict] = field(default_factory=list)
     error: str | None = None
@@ -68,6 +69,7 @@ class ReplayReport:
             "config_hash_ok": self.config_hash_ok,
             "n_decisions": self.n_decisions,
             "n_actions": self.n_actions,
+            "n_swaps": self.n_swaps,
             "n_decision_diffs": len(self.decision_diffs),
             "n_action_diffs": len(self.action_diffs),
             "decision_diffs": self.decision_diffs,
@@ -102,7 +104,25 @@ def replay_session(
             )
 
         events = original.events()
-        states = [e for e in events if e.get("event_type") == "state_observation"]
+        cycles = [e for e in events if e.get("event_type") == "decision"]
+        trades = [e for e in events if e.get("event_type") == "observed_trade"]
+        sentinel_checks = [
+            e for e in events if e.get("event_type") == "sentinel_check"
+        ]
+        report.n_swaps = len(trades)
+        sentinel_index = 0
+
+        def replay_sentinel(path: str) -> tuple[bool, str | None]:
+            nonlocal sentinel_index
+            if sentinel_index >= len(sentinel_checks):
+                raise ValueError("replay: exhausted sentinel_check sequence")
+            event = sentinel_checks[sentinel_index]
+            sentinel_index += 1
+            if event.get("path") != path:
+                raise ValueError(
+                    f"replay sentinel path mismatch: {event.get('path')} != {path}"
+                )
+            return bool(event.get("exists")), event.get("reason")
 
         # Scratch log for the replayed run.
         if replay_log_path is None:
@@ -112,10 +132,17 @@ def replay_session(
                               config_hash=actual_hash)
         try:
             observer = SwapObserver(replay_log, cfg.grid, cfg.pool_address)
-            keeper = Keeper(cfg, ReplayExecBridge(events),
-                            event_log=replay_log, swap_observer=observer)
-            # Drive each cycle: freeze time.time to the observed ts, run _cycle.
-            asyncio.run(_build_driver(keeper, states))
+            keeper = Keeper(
+                cfg,
+                ReplayExecBridge(events),
+                event_log=replay_log,
+                swap_observer=observer,
+                sentinel_reader=replay_sentinel if cfg.sentinel_path else None,
+                sentinel_clearer=lambda path: None,
+            )
+            # Drive each logged cycle and inject swap/sentinel inputs in order.
+            asyncio.run(_build_driver(keeper, cycles, trades))
+            keeper._finalize_log("replay")
         finally:
             replay_log.close()
 
@@ -164,19 +191,31 @@ def replay_session(
     return report
 
 
-def _build_driver(keeper: Keeper, states: list[dict]):
-    """Return an async coro that drives the keeper, freezing the clock per
-    observed ts (dlmm-logging-plan §7 step 3)."""
+def _build_driver(
+    keeper: Keeper, cycles: list[dict], trades: list[dict]
+):
+    """Drive every logged cycle and inject asynchronous swap inputs by seq."""
 
     async def drive() -> None:
-        if not states:
+        if not cycles:
             return
-        last_ts = float(states[0].get("ts") or states[0].get("ts_wall") or 0.0)
+        last_ts = float(cycles[0].get("ts") or cycles[0].get("ts_wall") or 0.0)
+        trade_index = 0
         with FrozenClock(start=last_ts) as clock:
-            for e in states:
-                ts = float(e.get("ts") or e.get("ts_wall") or last_ts)
+            for event in cycles:
+                ts = float(event.get("ts") or event.get("ts_wall") or last_ts)
                 clock.set(ts)
+                while (
+                    trade_index < len(trades)
+                    and int(trades[trade_index].get("seq", 0)) < int(event["seq"])
+                ):
+                    keeper.swap_observer.on_swap(_payload(trades[trade_index]))
+                    trade_index += 1
                 await keeper._cycle()
+                keeper._cycle_count += 1
+            while trade_index < len(trades):
+                keeper.swap_observer.on_swap(_payload(trades[trade_index]))
+                trade_index += 1
 
     return drive()
 

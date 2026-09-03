@@ -76,14 +76,7 @@ def record_session(cfg):
             cfg, bridge, event_log=log,
             swap_observer=SwapObserver(log, cfg.grid, cfg.pool_address),
         )
-        keeper.emit(
-            "run_started",
-            run_id=run_id, config_hash=hash_keeper_config(cfg),
-            config=dump_keeper_config(cfg), pool_address=cfg.pool_address,
-            dry_run=cfg.dry_run,
-            base_decimals=cfg.grid.base_decimals,
-            quote_decimals=cfg.grid.quote_decimals,
-        )
+        keeper._ensure_run_started()
 
         async def _run():
             with FrozenClock(start=start_ts, step=step) as clock:
@@ -97,7 +90,7 @@ def record_session(cfg):
                     )
                     clock.advance()
                     await keeper._cycle()
-            keeper.emit("run_stopped", reason="stop")
+            keeper._finalize_log("stop")
 
         asyncio.run(_run())
         log.close()

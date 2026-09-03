@@ -178,3 +178,115 @@ class TestVerify:
         rep = verify_tool.verify_run(path)
         assert rep.crossed_ours_without_fill == ["S1"]
         assert not rep.ok
+
+    def test_request_without_result_is_not_ok(self, verify_tool, tmp_path):
+        path = str(tmp_path / "orphan.jsonl")
+        with EventLog(path, run_id="r") as log:
+            log.emit("action_request", req_id="req_1", verb="withdraw", payload={})
+        rep = verify_tool.verify_run(path)
+        assert rep.req_missing_result == ["req_1"]
+        assert not rep.ok
+
+    def test_extra_chain_swap_is_not_ok(self, verify_tool, tmp_path):
+        class Chain:
+            def get_transaction(self, signature):
+                return {"program": "DLMM"}
+
+            def get_pool_signatures(self, pool, since, until):
+                return []
+
+        path = str(tmp_path / "extra.jsonl")
+        with EventLog(path, run_id="r") as log:
+            log.emit("run_started", pool_address="p")
+            log.emit(
+                "observed_trade",
+                tx_signature="unexpected",
+                crossed_ours=False,
+            )
+        rep = verify_tool.verify_run(path, chain=Chain())
+        assert rep.extra_swaps == ["unexpected"]
+        assert not rep.ok
+
+
+class TestVerifierOrdering:
+    def test_position_reference_before_creation_is_rejected(
+        self, verify_tool, tmp_path
+    ):
+        path = str(tmp_path / "out_of_order.jsonl")
+        with EventLog(path, run_id="r") as log:
+            log.emit("run_started", pool_address="p")
+            log.emit("position_observation", position_id="P1", ok=True)
+            log.emit("position_created", position_id="P1")
+            log.emit("run_stopped", reason="stop")
+        rep = verify_tool.verify_run(path)
+        assert rep.state_missing_creation == ["position_observation:P1"]
+        assert not rep.ok
+
+    def test_bootstrapped_position_is_valid_lifecycle_root(
+        self, verify_tool, tmp_path
+    ):
+        path = str(tmp_path / "bootstrap.jsonl")
+        with EventLog(path, run_id="r") as log:
+            log.emit(
+                "run_started",
+                pool_address="p",
+                config={"keeper": {"position_id": "P0"}},
+            )
+            log.emit("position_observation", position_id="P0", ok=True)
+            log.emit("run_stopped", reason="stop")
+        rep = verify_tool.verify_run(path)
+        assert rep.state_missing_creation == []
+        assert rep.ok, rep.to_dict()
+
+    def test_result_verb_must_match_request(self, verify_tool, tmp_path):
+        path = str(tmp_path / "verb.jsonl")
+        with EventLog(path, run_id="r") as log:
+            log.emit("run_started", pool_address="p")
+            log.emit(
+                "action_request", req_id="q1", verb="withdraw", payload={}
+            )
+            log.emit(
+                "action_result", req_id="q1", verb="swap", ok=False
+            )
+            log.emit("run_stopped", reason="stop")
+        rep = verify_tool.verify_run(path)
+        assert rep.req_result_mismatch == ["q1:verb"]
+        assert not rep.ok
+
+
+class TestSolanaRpcVerifier:
+    def test_normalizes_transaction_and_filters_pool_swaps(self, verify_tool):
+        calls = []
+
+        def rpc(method, params):
+            calls.append((method, params))
+            if method == "getSignaturesForAddress":
+                return [{"signature": "S1", "blockTime": 15, "err": None}]
+            if method == "getTransaction":
+                return {
+                    "slot": 7,
+                    "blockTime": 15,
+                    "meta": {
+                        "fee": 5000,
+                        "logMessages": ["Program log: Instruction: Swap"],
+                    },
+                    "transaction": {
+                        "message": {
+                            "accountKeys": [
+                                {"pubkey": "DLMM_PROGRAM"},
+                                {"pubkey": "POOL"},
+                            ]
+                        }
+                    },
+                }
+            raise AssertionError(method)
+
+        verifier = verify_tool.SolanaRpcVerifier(
+            "http://rpc.invalid", "DLMM_PROGRAM", rpc=rpc
+        )
+        tx = verifier.get_transaction("S1")
+        assert tx["program"] == "DLMM"
+        assert tx["fee_lamports"] == 5000
+        assert tx["slot"] == 7
+        assert verifier.get_pool_signatures("POOL", 10, 20) == ["S1"]
+        assert any(method == "getSignaturesForAddress" for method, _ in calls)

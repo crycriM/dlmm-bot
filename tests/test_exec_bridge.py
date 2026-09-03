@@ -13,6 +13,11 @@ class TestExecResult:
         r = ExecResult(ok=True)
         assert r.tx_signatures == []
 
+    def test_error_envelope_without_ok_is_failure(self):
+        r = ExecResult.from_payload({"error": "executor failed"})
+        assert not r.ok
+        assert r.error == "executor failed"
+
 
 class TestFakeExecBridge:
     def setup_method(self):

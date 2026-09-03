@@ -78,6 +78,19 @@ def _event_mid(ev: dict) -> float | None:
     return None
 
 
+def _token_amount(
+    event: dict, data: dict, key: str, decimals: int
+) -> float:
+    value = event.get(key, data.get(key))
+    if value is not None:
+        return float(value)
+    raw_key = f"{key}_raw"
+    raw = event.get(raw_key, data.get(raw_key))
+    if raw is None and key in ("x", "y"):
+        raw = event.get(f"{key}_raw", data.get(f"{key}_raw"))
+    return float(raw or 0.0) / (10 ** decimals)
+
+
 def explain_run(events: Iterable[dict]) -> RunPnL:
     """Fold a run log (as dicts, in seq order) into a RunPnL breakdown."""
     evs = list(events)
@@ -85,7 +98,11 @@ def explain_run(events: Iterable[dict]) -> RunPnL:
     markout = MarkoutTracker()
     out = RunPnL()
 
-    claimable_prev: tuple[float, float] | None = None
+    started = next((e for e in evs if e.get("event_type") == "run_started"), {})
+    base_decimals = int(started.get("base_decimals", 0) or 0)
+    quote_decimals = int(started.get("quote_decimals", 0) or 0)
+    claimable_prev: dict[str, tuple[float, float]] = {}
+    fee_accrual_observed = False
     fee_claimed_usd = 0.0
     inv: dict | None = None  # {"base": float, "quote": float}
     initial: dict | None = None
@@ -122,24 +139,32 @@ def explain_run(events: Iterable[dict]) -> RunPnL:
             out.n_fills += 1
             inv = _apply_fill_to_inventory(inv, side, size, price)
 
-        elif t == "position_observation":
+        elif t == "position_observation" and ev.get("ok", True):
             data = ev.get("data") if isinstance(ev.get("data"), dict) else {}
-            fee_x = float(data.get("claimable_fee_x") or 0.0)
-            fee_y = float(data.get("claimable_fee_y") or 0.0)
-            if claimable_prev is not None and mid:
-                out.lp_fee_accrued += (fee_x - claimable_prev[0]) * mid \
-                    + (fee_y - claimable_prev[1])
-            claimable_prev = (fee_x, fee_y)
+            fee_x = _token_amount(ev, data, "claimable_fee_x", base_decimals)
+            fee_y = _token_amount(ev, data, "claimable_fee_y", quote_decimals)
+            pid = str(ev.get("position_id") or "")
+            previous = claimable_prev.get(pid)
+            if previous is not None and mid:
+                # Claims/reset events are cash-basis events, not negative accrual.
+                out.lp_fee_accrued += max(0.0, fee_x - previous[0]) * mid \
+                    + max(0.0, fee_y - previous[1])
+                fee_accrual_observed = True
+            claimable_prev[pid] = (fee_x, fee_y)
 
         elif t in ("position_withdrawn", "position_closed"):
             fees = ev.get("fees_claimed")
             if isinstance(fees, dict) and mid:
-                fee_claimed_usd += float(fees.get("x") or 0.0) * mid \
-                    + float(fees.get("y") or 0.0)
+                fee_x = _token_amount(fees, fees, "x", base_decimals)
+                fee_y = _token_amount(fees, fees, "y", quote_decimals)
+                fee_claimed_usd += fee_x * mid + fee_y
             # fully exit open inventory (mirrors _inventory_trace)
             inv = {"base": 0.0, "quote": 0.0}
 
         elif t in ("position_created", "position_liquidity_added"):
+            pid = str(ev.get("position_id") or "")
+            if pid:
+                claimable_prev.setdefault(pid, (0.0, 0.0))
             inv = _add_bins_to_inventory(inv, ev)
             if inv is not None and initial is None:
                 initial = dict(inv)
@@ -154,16 +179,27 @@ def explain_run(events: Iterable[dict]) -> RunPnL:
                 if amt_in and amt_out and mid:
                     # amount_in is base-denominated (USD = in*mid),
                     # amount_out is quote-denominated (USD ≈ as-is)
-                    out.swap_slippage += max(
-                        0.0, float(amt_in) * mid - float(amt_out)
-                    )
+                    slippage = max(0.0, float(amt_in) * mid - float(amt_out))
+                    out.swap_slippage += slippage
+                    if slippage:
+                        ledger.on_cash_flow(
+                            "rebalance", ts, -slippage, label="swap_slippage"
+                        )
 
         elif t == "cash_flow":
             label = str(ev.get("label", ""))
             channel = "lp_fee" if label == "fees_claimed" else "rebalance"
-            ledger.on_cash_flow(
-                channel, ts, float(ev.get("amount_sol") or 0.0), label=label
-            )
+            amount = ev.get("amount_quote")
+            if amount is None:
+                amount = ev.get("amount_sol") or 0.0  # legacy event logs
+            ledger.on_cash_flow(channel, ts, float(amount), label=label)
+
+    out.lp_fee_claimed = fee_claimed_usd
+    authoritative_fee = (
+        out.lp_fee_accrued if fee_accrual_observed else out.lp_fee_claimed
+    )
+    if authoritative_fee:
+        ledger.on_cash_flow("lp_fee", last_ts, authoritative_fee, label="lp_fee")
 
     breakdown = ledger.explain(last_ts, mid) if mid else None
     if breakdown:
@@ -175,10 +211,11 @@ def explain_run(events: Iterable[dict]) -> RunPnL:
         out.markout_pnl = breakdown.markout_pnl
         out.rebalance_cost = breakdown.rebalance_cost
 
-    out.lp_fee_claimed = fee_claimed_usd
     out.lp_fee_divergence = abs(out.lp_fee_accrued - out.lp_fee_claimed)
     tol = max(1e-6, 0.01 * max(abs(out.lp_fee_accrued), abs(out.lp_fee_claimed)))
-    out.fee_divergence_flagged = out.lp_fee_divergence > tol
+    out.fee_divergence_flagged = (
+        fee_accrual_observed and out.lp_fee_divergence > tol
+    )
     if out.fee_divergence_flagged:
         out.flags.append(
             f"lp_fee divergence: accrued={out.lp_fee_accrued:.6f} "
@@ -234,6 +271,12 @@ def _add_bins_to_inventory(
     inv = dict(inv) if inv else {"base": 0.0, "quote": 0.0}
     for b in bins:
         if not isinstance(b, dict):
+            continue
+        amount_base = b.get("amount_base")
+        amount_quote = b.get("amount_quote")
+        if amount_base is not None or amount_quote is not None:
+            inv["base"] += float(amount_base or 0.0)
+            inv["quote"] += float(amount_quote or 0.0)
             continue
         amount = b.get("amount")
         price = b.get("price")
