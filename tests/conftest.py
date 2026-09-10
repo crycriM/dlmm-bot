@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
+from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -18,7 +21,7 @@ import pytest
 from dlmm_bot.clock import FrozenClock
 from dlmm_bot.config import DLMMConfig
 from dlmm_bot.event_log import EventLog
-from dlmm_bot.exec_bridge import FakeExecBridge
+from dlmm_bot.exec_bridge import ExecBridge, FakeExecBridge
 from dlmm_bot.grid import VenueGrid
 from dlmm_bot.keeper import (
     Keeper,
@@ -30,6 +33,105 @@ from dlmm_bot.risk_dlmm import PairType
 from dlmm_bot.swap_observer import SwapObserver
 
 _TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tools"))
+
+EXECUTOR_DIR = Path(__file__).resolve().parents[2] / "solana-clmm-executor"
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--executor-subprocess", action="store_true", default=False,
+        help="Also run keeper tests against the built, offline TS executor",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "executor_subprocess: requires the built sibling TS executor")
+
+
+class FixtureExecBridge(ExecBridge):
+    """Observe real requests; configure Node's canned read handler via a file.
+
+    Every response comes from Node through ExecBridge._send. No Python fake
+    result is substituted. Only the test runner reads this scenario file.
+    """
+
+    def __init__(self, node, scenario_path, *, injected=True):
+        self.calls = []
+        self.scenario_path = scenario_path
+        self.scenario = {"ok": True, "state": {}}
+        self._save()
+        cmd = [node, "fixtures/keeper-runner.mjs", str(scenario_path)] if injected else [node, "dist/bridge.js"]
+        super().__init__(cmd, cwd=str(EXECUTOR_DIR))
+
+    def _save(self):
+        self.scenario_path.write_text(json.dumps(self.scenario))
+
+    def set_state(self, pool, active_bin, balances=None, tvl_usd=None):
+        balances = balances or {"base": 0.0, "quote": 0.0}
+        self.scenario["state"] = {
+            "active_bin": active_bin, "balances": balances, "tvl_usd": tvl_usd,
+            "balances_raw": {
+                "base": str(round(balances["base"] * 10**9)),
+                "quote": str(round(balances["quote"] * 10**6)),
+            },
+        }
+        self._save()
+
+    def set_next_result(self, ok):
+        self.scenario["ok"] = ok
+        self._save()
+
+    def _send(self, request):
+        self.calls.append(request)
+        return super()._send(request)
+
+    def stop(self):
+        proc = self._proc
+        super().stop()
+        if proc is not None:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+
+
+@pytest.fixture
+def executor_env(request, monkeypatch, tmp_path):
+    if not request.config.getoption("--executor-subprocess"):
+        pytest.skip("enable with --executor-subprocess after npm run build in solana-clmm-executor")
+    node = shutil.which("node")
+    if node is None or not (EXECUTOR_DIR / "dist" / "bridge.js").is_file():
+        pytest.fail("Node and solana-clmm-executor/dist/bridge.js are required; run npm ci && npm run build")
+    env = {
+        "SOLANA_RPC_URL": "http://127.0.0.1:1", "SOLANA_RPC_WRITE_URL": "http://127.0.0.1:1",
+        "SOLANA_COMMITMENT": "confirmed", "WALLET_SIGNER": "kms", "DRY_RUN": "true",
+        "POOL_ALLOWLIST": "11111111111111111111111111111111",
+        "MINT_ALLOWLIST": "So11111111111111111111111111111111111111112,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "MAX_SOL_PER_TX": "0.5", "MAX_SOL_PER_RUN": "2", "MAX_SLIPPAGE_BPS": "50",
+        "MAX_PRIORITY_FEE_LAMPORTS": "100000", "JITO_ENABLED": "false", "JITO_TIP_LAMPORTS": "0",
+        "EXECUTOR_LOG_DIR": str(tmp_path / "executor-logs"),
+        "SWAP_STREAM_PATH": str(tmp_path / "swaps.jsonl"),
+    }
+    for key in ("KMS_KEY_ARN", "WALLET_SECRET_ARN", "JITO_BLOCK_ENGINE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return node, tmp_path
+
+
+@pytest.fixture
+def real_subprocess_bridge(executor_env):
+    node, tmp_path = executor_env
+    bridge = FixtureExecBridge(node, tmp_path / "scenario.json")
+    yield bridge
+    bridge.stop()
+
+
+@pytest.fixture
+def executor_cli_bridge(executor_env):
+    node, tmp_path = executor_env
+    bridge = FixtureExecBridge(node, tmp_path / "scenario.json", injected=False)
+    yield bridge
+    bridge.stop()
 
 
 @pytest.fixture

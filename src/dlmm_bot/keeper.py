@@ -876,8 +876,8 @@ class Keeper:
         if self._inventory_base > 0.01:
             req_id = self._next_req_id()
             payload = {
-                "in_mint": "base",
-                "out_mint": "quote",
+                "in_mint": self.cfg.base_mint,
+                "out_mint": self.cfg.quote_mint,
                 "amount": self._inventory_base,
                 "max_slippage_bps": 100,
                 "pool": None,
@@ -923,8 +923,8 @@ class Keeper:
         if self._inventory_base > 0.001:
             req_id = self._next_req_id()
             payload = {
-                "in_mint": "base",
-                "out_mint": "quote",
+                "in_mint": self.cfg.base_mint,
+                "out_mint": self.cfg.quote_mint,
                 "amount": self._inventory_base,
                 "max_slippage_bps": 200,  # accept 2% slippage in emergency
                 "pool": None,

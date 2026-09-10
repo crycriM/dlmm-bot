@@ -2,7 +2,7 @@
 
 Dynamic Limit Order market-making bot for Meteora-style DLMM pools on Solana.
 
-This package is the **DLMM execution-side bot** described in `clmm-animation/docs/dlmm-PROJECT_SUMMARY.md`, `dlmm-multi-venue-dlmm-mm-plan.md`, and `mm-bot-shared-architecture.md`. It pairs a Python keeper/backtester with shared logic from `mm_core`, while leaving Solana transaction building to a thin executor bridge.
+This package is the **DLMM execution-side bot** described in `clmm-animation/docs/dlmm-PROJECT_SUMMARY.md`, `dlmm-multi-venue-dlmm-mm-plan.md`, and `common-mm-bot-shared-architecture.md`. It pairs a Python keeper/backtester with shared logic from `mm_core`, while leaving Solana transaction building to a thin executor bridge.
 
 ## What this bot does
 

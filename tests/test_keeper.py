@@ -1,4 +1,4 @@
-"""Tests for the DLMM keeper loop — against a FakeExecBridge."""
+"""Keeper tests against FakeExecBridge and the opt-in real Node subprocess."""
 
 import asyncio
 import pytest
@@ -29,9 +29,9 @@ def cfg(grid):
     )
 
 
-@pytest.fixture
-def bridge():
-    b = FakeExecBridge()
+@pytest.fixture(params=["fake", pytest.param("subprocess", marks=pytest.mark.executor_subprocess)])
+def bridge(request):
+    b = FakeExecBridge() if request.param == "fake" else request.getfixturevalue("real_subprocess_bridge")
     # Start with zero inventory
     b.set_state("test_pool", active_bin=100, balances={"base": 0.0, "quote": 0.0}, tvl_usd=50000.0)
     return b
