@@ -257,6 +257,10 @@ class TestVerifierOrdering:
 class TestSolanaRpcVerifier:
     def test_normalizes_transaction_and_filters_pool_swaps(self, verify_tool):
         calls = []
+        pool = verify_tool._b58encode(bytes(range(32)))
+        event_cpi = verify_tool._b58encode(
+            b"eventcpi" + verify_tool._SWAP_EVENT_DISCRIMINATOR + bytes(range(32)) + b"payload"
+        )
 
         def rpc(method, params):
             calls.append((method, params))
@@ -269,12 +273,19 @@ class TestSolanaRpcVerifier:
                     "meta": {
                         "fee": 5000,
                         "logMessages": ["Program log: Instruction: Swap"],
+                        "innerInstructions": [{
+                            "index": 0,
+                            "instructions": [{
+                                "programId": "DLMM_PROGRAM",
+                                "data": event_cpi,
+                            }],
+                        }],
                     },
                     "transaction": {
                         "message": {
                             "accountKeys": [
                                 {"pubkey": "DLMM_PROGRAM"},
-                                {"pubkey": "POOL"},
+                                {"pubkey": pool},
                             ]
                         }
                     },
@@ -288,5 +299,5 @@ class TestSolanaRpcVerifier:
         assert tx["program"] == "DLMM"
         assert tx["fee_lamports"] == 5000
         assert tx["slot"] == 7
-        assert verifier.get_pool_signatures("POOL", 10, 20) == ["S1"]
+        assert verifier.get_pool_signatures(pool, 10, 20) == ["S1"]
         assert any(method == "getSignaturesForAddress" for method, _ in calls)

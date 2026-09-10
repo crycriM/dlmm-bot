@@ -1,4 +1,4 @@
-"""Gate 1: unmodified node dist/bridge.js entrypoint, receipt and keeper flow."""
+"""Gate 1: built bridge with explicitly injected offline handlers."""
 
 import asyncio
 import json

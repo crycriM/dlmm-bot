@@ -60,7 +60,7 @@ class FixtureExecBridge(ExecBridge):
         self.scenario_path = scenario_path
         self.scenario = {"ok": True, "state": {}}
         self._save()
-        cmd = [node, "fixtures/keeper-runner.mjs", str(scenario_path)] if injected else [node, "dist/bridge.js"]
+        cmd = [node, "fixtures/keeper-runner.mjs", str(scenario_path)] if injected else [node, "fixtures/stub-runner.mjs"]
         super().__init__(cmd, cwd=str(EXECUTOR_DIR))
 
     def _save(self):
@@ -104,6 +104,7 @@ def executor_env(request, monkeypatch, tmp_path):
     env = {
         "SOLANA_RPC_URL": "http://127.0.0.1:1", "SOLANA_RPC_WRITE_URL": "http://127.0.0.1:1",
         "SOLANA_COMMITMENT": "confirmed", "WALLET_SIGNER": "kms", "DRY_RUN": "true",
+        "WALLET_PUBKEY": "11111111111111111111111111111111",
         "POOL_ALLOWLIST": "11111111111111111111111111111111",
         "MINT_ALLOWLIST": "So11111111111111111111111111111111111111112,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "MAX_SOL_PER_TX": "0.5", "MAX_SOL_PER_RUN": "2", "MAX_SLIPPAGE_BPS": "50",

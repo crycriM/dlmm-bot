@@ -29,6 +29,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import sys
 import urllib.request
@@ -36,6 +38,29 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
 
 from dlmm_bot.event_log import ReplayLog
+
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {char: index for index, char in enumerate(_B58_ALPHABET)}
+_SWAP_EVENT_DISCRIMINATOR = hashlib.sha256(b"event:Swap").digest()[:8]
+
+
+def _b58decode(value: str) -> bytes:
+    number = 0
+    for char in value:
+        number = number * 58 + _B58_INDEX[char]
+    body = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
+    return b"\0" * (len(value) - len(value.lstrip("1"))) + body
+
+
+def _b58encode(value: bytes) -> str:
+    leading = len(value) - len(value.lstrip(b"\0"))
+    number = int.from_bytes(value, "big")
+    chars: list[str] = []
+    while number:
+        number, remainder = divmod(number, 58)
+        chars.append(_B58_ALPHABET[remainder])
+    return "1" * leading + "".join(reversed(chars))
 
 
 class ChainVerifier(Protocol):
@@ -123,6 +148,51 @@ class SolanaRpcVerifier:
             "raw": result,
         }
 
+    def _swap_pools(self, tx: dict) -> set[str]:
+        """Decode pool identities from current event-CPI and legacy log events.
+
+        A routed transaction may mention several candidate pools and log a
+        swap for only one of them. Treating every address mention as a swap
+        creates false completeness failures, so the event's own ``lbPair`` is
+        authoritative here just as it is in the TypeScript stream.
+        """
+        pools: set[str] = set()
+        raw = tx.get("raw") if isinstance(tx.get("raw"), dict) else tx
+        meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        for group in meta.get("innerInstructions") or []:
+            if not isinstance(group, dict):
+                continue
+            for instruction in group.get("instructions") or []:
+                if not isinstance(instruction, dict):
+                    continue
+                if str(instruction.get("programId") or "") != self.dlmm_program_id:
+                    continue
+                data = instruction.get("data")
+                if not isinstance(data, str):
+                    continue
+                try:
+                    payload = _b58decode(data)
+                except (KeyError, ValueError):
+                    continue
+                # Anchor event-CPI: instruction discriminator, event
+                # discriminator, then the Swap event whose first field is
+                # lbPair (32-byte public key).
+                if len(payload) >= 48 and payload[8:16] == _SWAP_EVENT_DISCRIMINATOR:
+                    pools.add(_b58encode(payload[16:48]))
+
+        for line in meta.get("logMessages") or []:
+            marker = "Program data: "
+            text = str(line)
+            if marker not in text:
+                continue
+            try:
+                payload = base64.b64decode(text.split(marker, 1)[1].strip(), validate=True)
+            except (ValueError, base64.binascii.Error):
+                continue
+            if len(payload) >= 40 and payload[:8] == _SWAP_EVENT_DISCRIMINATOR:
+                pools.add(_b58encode(payload[8:40]))
+        return pools
+
     def get_pool_signatures(
         self, pool: str, since: float, until: float
     ) -> list[str]:
@@ -149,9 +219,10 @@ class SolanaRpcVerifier:
                 if not signature:
                     continue
                 tx = self.get_transaction(str(signature))
-                logs = tx.get("logs", []) if tx else []
-                if tx and _is_dlmm_transaction(tx) and any(
-                    "swap" in str(line).lower() for line in logs
+                if (
+                    tx
+                    and _is_dlmm_transaction(tx)
+                    and pool in self._swap_pools(tx)
                 ):
                     swaps.append(str(signature))
             if reached_start or len(rows) < 1000:
