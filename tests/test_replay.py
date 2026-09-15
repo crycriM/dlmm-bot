@@ -255,6 +255,27 @@ class TestVerifierOrdering:
 
 
 class TestSolanaRpcVerifier:
+    def test_low_budget_waits_for_full_method_cost(self, verify_tool, monkeypatch):
+        now = 0.0
+        sleeps = []
+
+        def monotonic():
+            return now
+
+        def sleep(seconds):
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+
+        monkeypatch.setattr(verify_tool.time, "monotonic", monotonic)
+        monkeypatch.setattr(verify_tool.time, "sleep", sleep)
+        verifier = verify_tool.SolanaRpcVerifier(
+            "http://rpc.invalid", "DLMM_PROGRAM", max_cu_per_second=20
+        )
+        verifier._acquire_cu("getTransaction")
+        verifier._acquire_cu("getTransaction")
+        assert sleeps == [1.0, 2.0]
+
     def test_normalizes_transaction_and_filters_pool_swaps(self, verify_tool):
         calls = []
         pool = verify_tool._b58encode(bytes(range(32)))

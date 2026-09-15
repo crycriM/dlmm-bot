@@ -6,7 +6,8 @@ and SDK calls. Communication is JSON-lines: one request per stdin line,
 one response per stdout line.
 
 Verbs:
-  deposit_single_sided(pool, side, bins, amounts, strategy_type) → tx signatures
+  deposit_single_sided(pool, side, bins, amounts, expected_active_bin,
+                       max_active_bin_slippage, strategy_type) → tx signatures
   withdraw(position_id, bps)                                   → tx signatures
   swap(pool_or_jupiter, in_mint, out_mint, amount, max_slippage_bps) → swap result
   refresh_bundle(withdraw_pos, swap_spec, deposit_spec)        → bundle result
@@ -199,13 +200,19 @@ class ExecBridge:
         bin_ids: list[int],
         amounts: list[float],
         strategy_type: str = "Spot",
+        *,
+        expected_active_bin: int,
+        max_active_bin_slippage: int,
     ) -> ExecResult:
+        """Deposit target allocations; confirmed position readback is authoritative."""
         return self._send({
             "method": "deposit_single_sided",
             "pool": pool,
             "side": side,
             "bin_ids": bin_ids,
             "amounts": amounts,
+            "expected_active_bin": expected_active_bin,
+            "max_active_bin_slippage": max_active_bin_slippage,
             "strategy_type": strategy_type,
         })
 
@@ -324,11 +331,15 @@ class FakeExecBridge:
         return self._record("get_state", pool=pool)
 
     def deposit_single_sided(
-        self, pool, side, bin_ids, amounts, strategy_type="Spot",
+        self, pool, side, bin_ids, amounts, strategy_type="Spot", *,
+        expected_active_bin, max_active_bin_slippage,
     ) -> ExecResult:
         return self._record(
             "deposit_single_sided", pool=pool, side=side,
-            bin_ids=bin_ids, amounts=amounts, strategy_type=strategy_type,
+            bin_ids=bin_ids, amounts=amounts,
+            expected_active_bin=expected_active_bin,
+            max_active_bin_slippage=max_active_bin_slippage,
+            strategy_type=strategy_type,
         )
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
@@ -450,16 +461,22 @@ class ReplayExecBridge:
         return self._next_position()
 
     def deposit_single_sided(
-        self, pool, side, bin_ids, amounts, strategy_type="Spot",
+        self, pool, side, bin_ids, amounts, strategy_type="Spot", *,
+        expected_active_bin, max_active_bin_slippage,
     ) -> ExecResult:
         self.calls.append({
             "method": "deposit_single_sided", "pool": pool, "side": side,
             "bin_ids": list(bin_ids), "amounts": list(amounts),
+            "expected_active_bin": expected_active_bin,
+            "max_active_bin_slippage": max_active_bin_slippage,
             "strategy_type": strategy_type,
         })
         return self._next_result("deposit_single_sided", {
             "pool": pool, "side": side, "bin_ids": list(bin_ids),
-            "amounts": list(amounts), "strategy_type": strategy_type,
+            "amounts": list(amounts),
+            "expected_active_bin": expected_active_bin,
+            "max_active_bin_slippage": max_active_bin_slippage,
+            "strategy_type": strategy_type,
         })
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:

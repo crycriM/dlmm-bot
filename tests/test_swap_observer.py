@@ -61,6 +61,14 @@ class TestFills:
         assert _fills(log)[0]["position_id"] == "PID"
         assert ob.resting[101] == 0.0  # consumed after fill
 
+        # Crossing an already-consumed bin is observable, but it is no longer
+        # our liquidity and must not demand a second child fill in verify_log.
+        ob.on_swap({"tx_signature": "S2", "prev_active_bin": 100,
+                    "new_active_bin": 103, "direction": "up"}, ts=3.0)
+        second = [e for e in load_events(log.path)
+                  if e["event_type"] == "observed_trade"][-1]
+        assert second["crossed_ours"] is False
+
     def test_down_cross_buys_all_crossed_bids(self, grid, log):
         ob = SwapObserver(log, grid, "p")
         ob.register_ladder({101: 3.0, 99: 2.0})
@@ -77,6 +85,18 @@ class TestFills:
         assert _fills(log) == []
         trade = [e for e in load_events(log.path) if e["event_type"] == "observed_trade"][0]
         assert trade["crossed_ours"] is False
+
+    def test_wrong_side_liquidity_is_not_crossed_ours(self, grid, log):
+        ob = SwapObserver(log, grid, "p")
+        ob.register_ladder({101: {
+            "side": "bid", "amount_base": 0.0, "amount_quote": 100.0,
+        }})
+        ob.on_swap({"tx_signature": "S", "prev_active_bin": 100,
+                    "new_active_bin": 103, "direction": "up"}, ts=2.0)
+        trade = [e for e in load_events(log.path)
+                 if e["event_type"] == "observed_trade"][0]
+        assert trade["crossed_ours"] is False
+        assert _fills(log) == []
 
     def test_register_and_clear_ladder(self, grid, log):
         ob = SwapObserver(log, grid, "p")

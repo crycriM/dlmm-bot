@@ -108,6 +108,7 @@ def executor_env(request, monkeypatch, tmp_path):
         "POOL_ALLOWLIST": "11111111111111111111111111111111",
         "MINT_ALLOWLIST": "So11111111111111111111111111111111111111112,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
         "MAX_SOL_PER_TX": "0.5", "MAX_SOL_PER_RUN": "2", "MAX_SLIPPAGE_BPS": "50",
+        "MAX_ACTIVE_BIN_SLIPPAGE_BINS": "3",
         "MAX_PRIORITY_FEE_LAMPORTS": "100000", "JITO_ENABLED": "false", "JITO_TIP_LAMPORTS": "0",
         "EXECUTOR_LOG_DIR": str(tmp_path / "executor-logs"),
         "SWAP_STREAM_PATH": str(tmp_path / "swaps.jsonl"),

@@ -33,6 +33,8 @@ import base64
 import hashlib
 import json
 import sys
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -88,34 +90,73 @@ class SolanaRpcVerifier:
         dlmm_program_id: str,
         rpc: Callable[[str, list], object] | None = None,
         timeout: float = 30.0,
+        max_cu_per_second: float = 240.0,
     ):
         self.rpc_url = rpc_url
         self.dlmm_program_id = dlmm_program_id
         self.timeout = timeout
         self._rpc_override = rpc
         self._request_id = 0
+        self.max_cu_per_second = float(max_cu_per_second)
+        if self.max_cu_per_second <= 0:
+            raise ValueError("max_cu_per_second must be positive")
+        self._cu_tokens = self.max_cu_per_second
+        self._cu_capacity = self.max_cu_per_second
+        self._cu_updated = time.monotonic()
+        self._tx_cache: dict[str, Optional[dict]] = {}
+
+    def _acquire_cu(self, method: str) -> None:
+        cost = 40.0 if method in ("getTransaction", "getSignaturesForAddress") else 40.0
+        # Low custom budgets must delay expensive calls, not discount them.
+        self._cu_capacity = max(self._cu_capacity, cost)
+        while True:
+            now = time.monotonic()
+            elapsed = max(0.0, now - self._cu_updated)
+            self._cu_tokens = min(
+                self._cu_capacity,
+                self._cu_tokens + elapsed * self.max_cu_per_second,
+            )
+            self._cu_updated = now
+            if self._cu_tokens >= cost:
+                self._cu_tokens -= cost
+                return
+            time.sleep(max(0.001, (cost - self._cu_tokens) / self.max_cu_per_second))
 
     def _rpc(self, method: str, params: list):
         if self._rpc_override is not None:
             return self._rpc_override(method, params)
-        self._request_id += 1
-        body = json.dumps({
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": method,
-            "params": params,
-        }).encode("utf-8")
-        request = urllib.request.Request(
-            self.rpc_url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            envelope = json.loads(response.read().decode("utf-8"))
-        if envelope.get("error"):
-            raise RuntimeError(f"Solana RPC {method}: {envelope['error']}")
-        return envelope.get("result")
+        last_error: Exception | None = None
+        for attempt in range(6):
+            self._acquire_cu(method)
+            self._request_id += 1
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": self._request_id,
+                "method": method,
+                "params": params,
+            }).encode("utf-8")
+            request = urllib.request.Request(
+                self.rpc_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    envelope = json.loads(response.read().decode("utf-8"))
+                error = envelope.get("error")
+                if not error:
+                    return envelope.get("result")
+                if int(error.get("code", 0)) != 429:
+                    raise RuntimeError(f"Solana RPC {method}: {error}")
+                last_error = RuntimeError(f"Solana RPC {method}: rate limited")
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429:
+                    raise
+                last_error = exc
+            if attempt < 5:
+                time.sleep(min(16.0, float(2**attempt)))
+        raise RuntimeError(f"Solana RPC {method}: retries exhausted") from last_error
 
     @staticmethod
     def _account_keys(result: dict) -> list[str]:
@@ -128,17 +169,20 @@ class SolanaRpcVerifier:
         return keys
 
     def get_transaction(self, signature: str) -> Optional[dict]:
+        if signature in self._tx_cache:
+            return self._tx_cache[signature]
         result = self._rpc("getTransaction", [signature, {
             "encoding": "jsonParsed",
             "maxSupportedTransactionVersion": 0,
             "commitment": "finalized",
         }])
         if not isinstance(result, dict):
+            self._tx_cache[signature] = None
             return None
         meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
         programs = self._account_keys(result)
         logs = list(meta.get("logMessages") or [])
-        return {
+        normalized = {
             "program": "DLMM" if self.dlmm_program_id in programs else "",
             "programs": programs,
             "slot": result.get("slot"),
@@ -147,6 +191,8 @@ class SolanaRpcVerifier:
             "logs": logs,
             "raw": result,
         }
+        self._tx_cache[signature] = normalized
+        return normalized
 
     def _swap_pools(self, tx: dict) -> set[str]:
         """Decode pool identities from current event-CPI and legacy log events.
@@ -451,7 +497,12 @@ def verify_run(path: str, chain: Optional[ChainVerifier] = None) -> VerifyReport
                 report.crossed_ours_without_fill.append(str(sig))
         if chain is not None and sig:
             tx = chain.get_transaction(str(sig))
-            chain_fills = tx.get("bin_fills", []) if isinstance(tx, dict) else []
+            # The stdlib Solana verifier validates program/signature/fees but
+            # does not decode per-position bin fills. Only a richer adapter
+            # that explicitly supplies bin_fills can support this comparison.
+            if not isinstance(tx, dict) or "bin_fills" not in tx:
+                continue
+            chain_fills = tx.get("bin_fills", [])
             for fill in (f for f in fills if f.get("tx_signature") == sig):
                 match = next((
                     row for row in chain_fills
@@ -471,6 +522,15 @@ def verify_run(path: str, chain: Optional[ChainVerifier] = None) -> VerifyReport
         seen.add(s)
 
     if chain is not None:
+        # Replayed swap streams are often verified after capture, so ts_wall is
+        # processing time rather than chain time. The decoded block timestamp
+        # is the authoritative completeness window when trades are present.
+        trade_times = [
+            float(t.get("block_time") or t.get("ts") or t.get("ts_wall") or 0.0)
+            for t in trades
+        ]
+        if trade_times:
+            first_ts, last_ts = min(trade_times), max(trade_times)
         pool = (log.run_started or {}).get("pool_address") \
             or (trades[0].get("pool") if trades else "")
         chain_sigs = set(chain.get_pool_signatures(str(pool or ""), first_ts, last_ts))
@@ -489,11 +549,21 @@ def main(argv: list[str] | None = None) -> int:
         "--dlmm-program-id",
         help="expected Meteora DLMM program address (required with --rpc-url)",
     )
+    ap.add_argument(
+        "--max-cu-per-second",
+        type=float,
+        default=240.0,
+        help="client-side RPC throughput budget (default: 240 CU/s)",
+    )
     args = ap.parse_args(argv)
     if args.rpc_url and not args.dlmm_program_id:
         ap.error("--dlmm-program-id is required with --rpc-url")
     chain = (
-        SolanaRpcVerifier(args.rpc_url, args.dlmm_program_id)
+        SolanaRpcVerifier(
+            args.rpc_url,
+            args.dlmm_program_id,
+            max_cu_per_second=args.max_cu_per_second,
+        )
         if args.rpc_url else None
     )
 

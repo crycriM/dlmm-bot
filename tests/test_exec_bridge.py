@@ -35,6 +35,7 @@ class TestFakeExecBridge:
     def test_deposit_single_sided(self):
         result = self.bridge.deposit_single_sided(
             "pool", "bid", [100, 101, 102], [10, 20, 30], "Spot",
+            expected_active_bin=103, max_active_bin_slippage=1,
         )
         assert result.ok
         assert result.tx_signatures == ["fake_tx_001"]
@@ -43,6 +44,8 @@ class TestFakeExecBridge:
         assert call["side"] == "bid"
         assert call["bin_ids"] == [100, 101, 102]
         assert call["amounts"] == [10, 20, 30]
+        assert call["expected_active_bin"] == 103
+        assert call["max_active_bin_slippage"] == 1
 
     def test_withdraw(self):
         result = self.bridge.withdraw("pos_001", bps=50)

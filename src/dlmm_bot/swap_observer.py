@@ -109,7 +109,20 @@ class SwapObserver:
             if direction == "up"
             else list(range(new + 1, prev + 1))
         )
-        crossed_ours = any(b in self._resting for b in crossed)
+        def has_resting_liquidity(bin_id: int) -> bool:
+            resting = self._resting.get(bin_id)
+            if isinstance(resting, dict):
+                expected_side = "ask" if direction == "up" else "bid"
+                if resting.get("side") not in (None, expected_side):
+                    return False
+                # Upward traversal consumes base/ask liquidity; downward
+                # traversal consumes quote/bid liquidity. A mixed active bin
+                # is ours only when the token actually consumed is non-zero.
+                token_key = "amount_base" if direction == "up" else "amount_quote"
+                return float(resting.get(token_key, 0.0) or 0.0) > 0
+            return resting is not None and float(resting) > 0
+
+        crossed_ours = any(has_resting_liquidity(b) for b in crossed)
         decoded_bins = {
             int(row["bin_id"]): row
             for row in (payload.get("bins_crossed") or [])

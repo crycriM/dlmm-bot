@@ -70,8 +70,47 @@ class TestKeeperInit:
     def test_no_hedge_for_bluechip(self, keeper):
         assert keeper.hedge is None
 
+    def test_rejects_invalid_active_bin_slippage(self, cfg, bridge):
+        cfg.max_active_bin_slippage = -1
+        with pytest.raises(ValueError, match="max_active_bin_slippage"):
+            Keeper(cfg, bridge)
+
 
 class TestKeeperCycle:
+    def test_observation_only_logs_reads_without_policy_or_writes(self, cfg, tmp_path):
+        cfg.observation_only = True
+        cfg.position_id = "owned_position"
+        cfg.log_dir = str(tmp_path)
+        bridge = FakeExecBridge()
+        bridge.set_state(cfg.pool_address, active_bin=100, balances={"base": 1.0, "quote": 10.0})
+        bridge.set_position("owned_position", {
+            "active_bin": 100,
+            "bins": [],
+            "claimable_fee_x_raw": "123",
+            "claimable_fee_y_raw": "456",
+        })
+        keeper = Keeper(cfg, bridge)
+        try:
+            record = asyncio.run(keeper._cycle())
+        finally:
+            keeper.stop()
+        assert record.action == "observation_only"
+        assert [call["method"] for call in bridge.calls] == ["get_state", "get_position"]
+        events = ReplayLog(keeper.event_log_path).events()
+        assert any(event["event_type"] == "state_observation" for event in events)
+        assert any(
+            event["event_type"] == "position_observation"
+            and event["claimable_fee_x_raw"] == "123"
+            and event["claimable_fee_y_raw"] == "456"
+            for event in events
+        )
+
+    def test_observation_only_rejects_non_dry_run(self, cfg):
+        cfg.observation_only = True
+        cfg.dry_run = False
+        with pytest.raises(ValueError, match="requires dry_run"):
+            Keeper(cfg, FakeExecBridge())
+
     def test_cycle_returns_record(self, keeper, bridge):
         """A single cycle should produce a CycleRecord."""
         loop = asyncio.new_event_loop()

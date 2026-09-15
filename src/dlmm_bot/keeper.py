@@ -57,11 +57,13 @@ class KeeperConfig:
     grid: VenueGrid = field(default_factory=lambda: VenueGrid(150.0, 2, 6, 9))
     refresh_interval: float = 5.0      # seconds between poll cycles
     drift_threshold_bins: int = 3      # re-center when active bin drifts this many bins
+    max_active_bin_slippage: int = 0   # execution tolerance in bins; 0 fails closed
     inv_tolerance: float = 0.25         # inventory skew tolerance
     pair_type: PairType = PairType.BLUECHIP
     hedge_config: HedgeConfig | None = None
     pool_address: str = ""
     dry_run: bool = True                # shadow mode: log decisions, don't submit tx
+    observation_only: bool = False      # M2 read gate: poll/log, skip strategy and actuation
     position_id: str | None = None     # current LP position
     max_history: int = 500              # price history deque size
     sentinel_path: str | None = None   # kill sentinel file path (written by tvl_monitor.py)
@@ -85,11 +87,13 @@ def dump_keeper_config(cfg: KeeperConfig) -> dict:
         "keeper": {
             "refresh_interval": cfg.refresh_interval,
             "drift_threshold_bins": cfg.drift_threshold_bins,
+            "max_active_bin_slippage": cfg.max_active_bin_slippage,
             "inv_tolerance": cfg.inv_tolerance,
             "pair_type": cfg.pair_type.value,
             "hedge_config": asdict(cfg.hedge_config) if cfg.hedge_config else None,
             "pool_address": cfg.pool_address,
             "dry_run": cfg.dry_run,
+            "observation_only": cfg.observation_only,
             "position_id": cfg.position_id,
             "max_history": cfg.max_history,
             "sentinel_path": cfg.sentinel_path,
@@ -127,11 +131,13 @@ def rebuild_keeper_config(dump: dict) -> KeeperConfig:
         grid=VenueGrid(**dump["grid"]),
         refresh_interval=k.get("refresh_interval", 5.0),
         drift_threshold_bins=k.get("drift_threshold_bins", 3),
+        max_active_bin_slippage=k.get("max_active_bin_slippage", 0),
         inv_tolerance=k.get("inv_tolerance", 0.25),
         pair_type=PairType(k.get("pair_type", PairType.BLUECHIP.value)),
         hedge_config=HedgeConfig(**k["hedge_config"]) if k.get("hedge_config") else None,
         pool_address=k.get("pool_address", ""),
         dry_run=k.get("dry_run", True),
+        observation_only=k.get("observation_only", False),
         position_id=k.get("position_id"),
         max_history=k.get("max_history", 500),
         sentinel_path=k.get("sentinel_path"),
@@ -181,6 +187,14 @@ class Keeper:
         sentinel_reader: Callable[[str], tuple[bool, str | None]] | None = None,
         sentinel_clearer: Callable[[str], None] | None = None,
     ):
+        if (
+            isinstance(cfg.max_active_bin_slippage, bool)
+            or not isinstance(cfg.max_active_bin_slippage, int)
+            or cfg.max_active_bin_slippage < 0
+        ):
+            raise ValueError("max_active_bin_slippage must be a non-negative integer")
+        if cfg.observation_only and not cfg.dry_run:
+            raise ValueError("observation_only requires dry_run=True")
         self.cfg = cfg
         self.exec = exec_bridge
         self.publish = publish or (lambda subject, payload: None)
@@ -438,6 +452,13 @@ class Keeper:
         if self.swap_observer is not None:
             self.swap_observer.set_last_mid(mid, ts)
         self.emit("pnl_mark", ts=ts, mid=mid)
+
+        if self.cfg.observation_only:
+            # The M2 mainnet gate needs real keeper observations without
+            # reusing uncalibrated AS gamma/kappa or evaluating write policy.
+            return self._finish_cycle(self._make_record(
+                ts, Decision.STOP_QUOTING, "normal", "observation_only", mid=mid,
+            ))
 
         # TVL from state (if available from bus publisher)
         tvl_usd = state.get("tvl_usd")
@@ -703,6 +724,8 @@ class Keeper:
                 "side": "bid",
                 "bin_ids": [l.bin_id for l in bids],
                 "amounts": [l.size for l in bids],
+                "expected_active_bin": self._active_bin,
+                "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "strategy_type": "Spot",
             }
             self._emit_action(req_id, "deposit_single_sided", payload)
@@ -736,6 +759,8 @@ class Keeper:
                 "side": "ask",
                 "bin_ids": [l.bin_id for l in asks],
                 "amounts": [l.size for l in asks],
+                "expected_active_bin": self._active_bin,
+                "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "strategy_type": "Spot",
             }
             self._emit_action(req_id, "deposit_single_sided", payload)
@@ -775,6 +800,8 @@ class Keeper:
             "swap_spec": None,  # TODO: compute rebalance swap from inventory imbalance
             "deposit_spec": {
                 "pool": self.cfg.pool_address,
+                "expected_active_bin": self._active_bin,
+                "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "bid_bins": [l.bin_id for l in bids],
                 "ask_bins": [l.bin_id for l in asks],
                 "bid_amounts": [l.size for l in bids],
