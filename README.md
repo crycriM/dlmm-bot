@@ -2,7 +2,9 @@
 
 Dynamic Limit Order market-making bot for Meteora-style DLMM pools on Solana.
 
-This package is the **DLMM execution-side bot** described in `clmm-animation/docs/dlmm-PROJECT_SUMMARY.md`, `dlmm-multi-venue-dlmm-mm-plan.md`, and `common-mm-bot-shared-architecture.md`. It pairs a Python keeper/backtester with shared logic from `mm_core`, while leaving Solana transaction building to a thin executor bridge.
+This package pairs a Python DLMM keeper and event-replay backtester with shared
+market-making logic from `mm_core`, while leaving Solana transaction building
+to a thin executor bridge.
 
 ## What this bot does
 
@@ -61,7 +63,7 @@ The bot places liquidity as discrete bin levels, not CLOB orders.
 
 ### Keeper loop
 
-`Keeper` follows the design docs:
+Each keeper cycle:
 
 1. Poll pool state from the executor bridge
 2. Build price history and evaluate regime with `mm_core`
@@ -100,16 +102,36 @@ It emits `ExecIntent`s for an external perp executor instead of placing hedge or
 
 ## Install
 
+Create a project-local virtual environment. Do not install into the system
+Python, and do not reuse another project's environment.
+
 ```bash
-pip install -e .
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ../mm-core
+python -m pip install -e ".[dev]"
 ```
 
-Requires Python 3.11+ and `mm_core`.
+Requires Python 3.11+ and the sibling `mm-core` checkout. The optional executor
+integration tests also require Node.js and a built sibling
+`solana-clmm-executor` checkout.
 
 ## Tests
 
+The default suite is offline and does not need wallet credentials or network
+access:
+
 ```bash
 pytest
+```
+
+The opt-in subprocess lane uses the sibling executor's deterministic offline
+handlers. It generates a test-only wallet key, reads required public IDs from
+the sibling's canonical fixtures, and uses a deliberately closed loopback RPC
+endpoint; it does not use a live wallet or pool:
+
+```bash
+pytest --executor-subprocess
 ```
 
 The test suite covers:
@@ -122,3 +144,29 @@ The test suite covers:
 - executor bridge protocol
 - backtest accounting and metrics
 
+## Configuration and secrets
+
+`dlmm-bot` does not own exchange credentials. The Solana executor is the
+execution boundary and receives its configuration through environment
+variables at runtime. Never commit RPC URLs containing access tokens, API
+keys, private keys, seed phrases, keypair files, wallet addresses, pool
+addresses, or position addresses.
+
+Local `.env` variants, key files, wallet JSON files, event logs, and runtime
+log directories are ignored by Git. If a credential is ever committed,
+revoke it and remove it from the full Git history before publishing; deleting
+it only from the latest revision is insufficient.
+
+`tools/live_keeper_soak.py` is an explicit, read-only integration gate. It
+requires runtime-supplied public identifiers and an RPC endpoint, rejects
+secret-bearing wallet variables, forces both layers into dry-run mode, and
+sets all transaction budgets to zero. Keep real values in your local secret
+manager or untracked environment, never in scripts or tests.
+
+## Safety status
+
+This project is experimental trading software. Default tests and examples are
+offline. Before any live deployment, follow the staged backtest, shadow,
+appropriate pre-production gates, and micro-capital rollout described in the
+parent project documentation. Review `status.md` for current implementation
+gaps and do not treat a passing unit suite as evidence of live-trading safety.

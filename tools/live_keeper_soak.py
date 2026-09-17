@@ -1,8 +1,9 @@
-"""Read-only M2 keeper soak against the sibling Solana executor.
+"""Read-only keeper soak against the sibling Solana executor.
 
-Source solana-clmm-executor/.env.m3 into the shell first. This launcher never
-loads a signer, forces both keeper and executor dry-run, and rejects secret
-environment variables. It is an observation gate, not strategy calibration.
+Provide the required public identifiers and RPC endpoint as environment
+variables at runtime. This launcher never loads a signer, forces both keeper
+and executor dry-run, and rejects secret environment variables. It is an
+observation gate, not strategy calibration.
 """
 
 from __future__ import annotations
@@ -59,7 +60,7 @@ def validate_read_only() -> None:
 
 
 def configure_executor(output: Path) -> None:
-    """Set only read-only production bridge settings; retain RPC/WS from .env.m3."""
+    """Set only read-only bridge settings and retain runtime RPC/WS values."""
     allowed = (
         "PATH", "HOME", "LANG", "TZ", "RUN_LIVE", "SOLANA_RPC_URL",
         "SOLANA_RPC_WRITE_URL", "SOLANA_WS_URL", "SOLANA_COMMITMENT",

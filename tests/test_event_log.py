@@ -1,4 +1,4 @@
-"""EventLog / ReplayLog / converter / config round-trip (Phase 1)."""
+"""EventLog, ReplayLog, converter, and config round-trip tests."""
 
 from __future__ import annotations
 

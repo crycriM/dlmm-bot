@@ -1,6 +1,6 @@
 """
-On-chain swap observation (dlmm-logging-plan §4) — the critical missing
-piece: the keeper only polls active_bin every 5 s, so crossings that enter
+On-chain swap observation closes a polling gap: the keeper only polls
+active_bin every 5 s, so crossings that enter
 and revert within a poll interval are invisible for fill/fee/markout
 matching.
 

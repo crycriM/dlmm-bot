@@ -1,4 +1,4 @@
-"""explain_run: pure-fold PnL breakdown over a run log (plan §5).
+"""explain_run: pure-fold PnL breakdown over a run log.
 
 Events are synthetic in-memory dicts (no JSONL file) — explain_run is a pure
 function of the folded facts, so this isolates the accounting math.

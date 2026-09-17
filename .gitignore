@@ -4,3 +4,16 @@ __pycache__/
 .venv/
 *.egg-info/
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+*-keypair.json
+wallet*.json
+*.jsonl
+logs/
+build/
+dist/
+.coverage
+htmlcov/
+project-internal/

@@ -1,4 +1,4 @@
-"""VenueGrid round-trip tests (fix 1.1 of the DLMM plan)."""
+"""VenueGrid round-trip tests."""
 
 import math
 import pytest

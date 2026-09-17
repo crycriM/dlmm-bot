@@ -55,7 +55,8 @@ class TestFakeExecBridge:
 
     def test_swap(self):
         result = self.bridge.swap(
-            in_mint="So111", out_mint="EPjFWd", amount=1.5, max_slippage_bps=100,
+            in_mint="So111", out_mint="EPjFWd", amount=1.5, pool="pool_001",
+            max_slippage_bps=100,
         )
         assert result.ok
         call = self.bridge.calls[0]

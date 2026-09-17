@@ -5,14 +5,14 @@ inventory caps.
 This extends mm_core.risk_policy with checks that only apply to DLMM
 spot LP positions (no liquidation risk, but rug/custody risk instead).
 
-Pair types (per dlmm plan §5):
+Pair types:
   - bluechip (SOL/USDC): full ladder, low kill-switch sensitivity
   - memecoin (MEMECOIN/SOL): one-sided cap, strict gate, rug kill-switch
   - exotic (large-cap/large-cap): both legs hedgeable, relaxed trend gate
 
-The rug monitor is a separate consumer per shared-arch §5 — a stuck
-keeper can't block kill-switch detection.  This module provides the
-detection logic that the separate consumer runs.
+The rug monitor is a separate consumer so a stuck keeper cannot block
+kill-switch detection. This module provides the detection logic that the
+separate consumer runs.
 """
 
 from __future__ import annotations

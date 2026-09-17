@@ -1,8 +1,8 @@
 """
 DLMM event-replay backtester.
 
-Per the dlmm plan §7/§9: replays historical bin-crossing events (swaps
-that cross bins) through the AS-driven ladder, accumulating:
+Replays historical bin-crossing events (swaps that cross bins) through the
+AS-driven ladder, accumulating:
   - spread capture (buy low bin, sell high bin)
   - crossed-bin dynamic fees (only crossed bins accrue)
   - square-root impact on rebalance swaps
@@ -13,7 +13,7 @@ Fill rule: when a swap crosses a bin where the ladder has a resting
 position, the position fills at that bin's fixed price. Single-sided
 positions fill only on the crossed side.
 
-Metrics (per dlmm plan §9 gates):
+Evaluation metrics:
   - Sharpe ratio > baseline
   - Max drawdown < baseline
   - Realized markout net of fees/gas > 0

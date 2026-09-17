@@ -4,7 +4,7 @@ The active bin is shifted by the AS inventory-tilt to produce a new
 ladder center.  Inner levels start at `inner_offset` bins from center,
 and per-level sizes are scaled by skew derived from inventory error.
 
-AS mapping (per the DLMM plan):
+AS mapping:
     center = active_bin + round((r - S) / bin_width_in_bins)
     inner_offset = round(half_spread / bin_width_in_bins)
     ask_frac = 0.5 * (1 + skew),  bid_frac = 1 - ask_frac

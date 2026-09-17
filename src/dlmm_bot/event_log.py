@@ -1,7 +1,7 @@
 """
 Append-only, event-sourced JSONL log for a dlmm-bot run.
 
-Design (docs/dlmm-logging-plan.md §1):
+Log properties:
 - one JSONL file per run: every record carries seq (monotonic, gap-free),
   run_id, schema_version, event_type, ts_wall, cycle, config_hash
 - serialized writer: emit() is guarded by one process-local lock, so keeper

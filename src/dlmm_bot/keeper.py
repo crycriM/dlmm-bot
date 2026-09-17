@@ -1,7 +1,7 @@
 """
 DLMM keeper: off-chain poll → evaluate → actuate loop.
 
-Per the dlmm plan §9 and the shared-arch §5, the keeper:
+The keeper:
 1. Polls market data (MarketSnapshot from bus/WS — or get_state from exec bridge)
 2. Runs mm_core.evaluate_regime + RiskPolicy (+ DLMM-specific risk checks)
 3. Builds ladder via build_ladder with AS-driven center/skew
@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from collections import deque
@@ -63,8 +64,12 @@ class KeeperConfig:
     hedge_config: HedgeConfig | None = None
     pool_address: str = ""
     dry_run: bool = True                # shadow mode: log decisions, don't submit tx
-    observation_only: bool = False      # M2 read gate: poll/log, skip strategy and actuation
+    observation_only: bool = False      # poll/log only; skip strategy and actuation
     position_id: str | None = None     # current LP position
+    # A two-sided ladder lands in two distinct PDAs (bid and ask ranges never
+    # share a position); the ask-side PDAs ride here so stop/refresh/emergency
+    # can close everything the run opened. Persisted for restart recovery.
+    extra_position_ids: tuple[str, ...] = ()
     max_history: int = 500              # price history deque size
     sentinel_path: str | None = None   # kill sentinel file path (written by tvl_monitor.py)
     log_dir: str | None = None          # event-log dir; None disables file logging
@@ -95,6 +100,7 @@ def dump_keeper_config(cfg: KeeperConfig) -> dict:
             "dry_run": cfg.dry_run,
             "observation_only": cfg.observation_only,
             "position_id": cfg.position_id,
+            "extra_position_ids": list(cfg.extra_position_ids),
             "max_history": cfg.max_history,
             "sentinel_path": cfg.sentinel_path,
             "base_mint": cfg.base_mint,
@@ -114,7 +120,7 @@ def hash_keeper_config(cfg: KeeperConfig) -> str:
 
 
 def rebuild_keeper_config(dump: dict) -> KeeperConfig:
-    """Invert dump_keeper_config() for rerun (dlmm-logging-plan §7)."""
+    """Invert dump_keeper_config() for a deterministic rerun."""
     from dlmm_bot.config import DLMMConfig
 
     dlmm_d = dict(dump["dlmm"])
@@ -139,6 +145,7 @@ def rebuild_keeper_config(dump: dict) -> KeeperConfig:
         dry_run=k.get("dry_run", True),
         observation_only=k.get("observation_only", False),
         position_id=k.get("position_id"),
+        extra_position_ids=tuple(k.get("extra_position_ids", [])),
         max_history=k.get("max_history", 500),
         sentinel_path=k.get("sentinel_path"),
         base_mint=k.get("base_mint", ""),
@@ -228,13 +235,14 @@ class Keeper:
         self._active_bin: int = 0
         self._center_bin: int = 0  # last deployed center
         self._current_position_id: str | None = cfg.position_id
+        self._extra_position_ids: list[str] = list(cfg.extra_position_ids)
         self._inventory_base: float = 0.0
         self._inventory_quote: float = 0.0  # in quote tokens
         self._halted = False
         self._cycle_count = 0
         self._decision_log: list[CycleRecord] = []
 
-        # Event-sourcing state (dlmm-logging-plan §1-2)
+        # Event-sourcing state used for audit and deterministic replay.
         self._config_hash: str = hash_keeper_config(cfg)
         self._run_id: str = self.log.run_id if self.log is not None else ""
         self._req_counter = 0
@@ -430,13 +438,16 @@ class Keeper:
             )
         self._prev_active_bin = self._active_bin
 
-        # Per-cycle position observation (dlmm-logging-plan §4)
-        if self._current_position_id is not None:
-            pos_result = self.exec.get_position(self._current_position_id)
+        # Observe every tracked position each cycle so reconciliation covers
+        # the full two-sided ladder.
+        for position_id in [self._current_position_id, *self._extra_position_ids]:
+            if position_id is None:
+                continue
+            pos_result = self.exec.get_position(position_id)
             pos_data = pos_result.data if isinstance(pos_result.data, dict) else {}
             self.emit(
                 "position_observation",
-                position_id=self._current_position_id,
+                position_id=position_id,
                 ok=pos_result.ok,
                 error=pos_result.error,
                 data=_jsonable(pos_result.data),
@@ -454,8 +465,8 @@ class Keeper:
         self.emit("pnl_mark", ts=ts, mid=mid)
 
         if self.cfg.observation_only:
-            # The M2 mainnet gate needs real keeper observations without
-            # reusing uncalibrated AS gamma/kappa or evaluating write policy.
+            # Collect real keeper observations without reusing uncalibrated AS
+            # parameters or evaluating write policy.
             return self._finish_cycle(self._make_record(
                 ts, Decision.STOP_QUOTING, "normal", "observation_only", mid=mid,
             ))
@@ -571,7 +582,13 @@ class Keeper:
                 ),
             )
 
-            center_bin = min(l.bin_id for l in ladder if l.side == "bid") if ladder else self._active_bin
+            # Ladder midpoint is for the record; drift compares the deploy-time
+            # active bin against the current one (AS re-centres the ladder, so
+            # any fixed ladder point sits ~half a width away from the price).
+            center_bin = (
+                (min(l.bin_id for l in ladder) + max(l.bin_id for l in ladder)) // 2
+                if ladder else self._active_bin
+            )
             drift = abs(self._active_bin - self._center_bin) if self._center_bin else 0
 
             if self._current_position_id is None:
@@ -636,6 +653,51 @@ class Keeper:
             "fee_lamports": result.total_fee_lamports,
             "compute_unit_price": result.compute_unit_price,
         }
+
+    def _adopt_opened_positions(self, result: ExecResult) -> None:
+        """Record every position a deposit/refresh response opened: the first
+        id stays primary, further PDAs (the other side of a two-sided ladder)
+        are tracked so stop/refresh/emergency can close all of them."""
+        data = result.data if isinstance(result.data, dict) else {}
+        ids = [pid for pid in (data.get("position_ids") or []) if pid]
+        if not ids:
+            single = data.get("position_id") or result.position_id
+            if single:
+                ids = [single]
+        if not ids:
+            return
+        self._current_position_id = ids[0]
+        self._extra_position_ids = list(ids[1:])
+
+    async def _withdraw_extra_positions(self, tag: str) -> bool:
+        """Close ask-side PDAs opened by two-sided ladders. Keeps any id that
+        failed to withdraw so it is never silently dropped."""
+        ok = True
+        remaining: list[str] = []
+        for position_id in self._extra_position_ids:
+            req_id = self._next_req_id()
+            payload = {"position_id": position_id, "bps": 100}
+            self._emit_action(req_id, "withdraw", payload)
+            result = self.exec.withdraw(**payload)
+            self._emit_result(req_id, "withdraw", result, tag)
+            if result.ok:
+                data = result.data if isinstance(result.data, dict) else {}
+                self.emit(
+                    "position_withdrawn",
+                    position_id=position_id,
+                    bps=100,
+                    fees_claimed=data.get("fees_claimed"),
+                    amounts_returned=data.get("amounts_returned"),
+                    **self._chain_fields(result),
+                )
+            else:
+                logger.error(
+                    "Withdraw of extra position %s failed: %s", position_id, result.error
+                )
+                remaining.append(position_id)
+                ok = False
+        self._extra_position_ids = remaining
+        return ok
 
     def _emit_result(
         self, req_id: str, verb: str, result: ExecResult, gas_label: str
@@ -708,14 +770,38 @@ class Keeper:
             position_id,
         )
 
+    @staticmethod
+    def _quantized_side(levels: list[LadderLevel], side: str, grid) -> tuple[list[LadderLevel], list[float]]:
+        """Quantize ladder sizes to whole raw units of the side's token.
+
+        The executor rejects amounts whose token-raw representation is not an
+        integer (bad_request, fail-closed), and AS-driven sizes are unrounded
+        floats. Levels that floor to zero raw units cannot be funded and are
+        dropped, matching the zero-size ladder filter.
+        """
+        decimals = grid.quote_decimals if side == "bid" else grid.base_decimals
+        kept: list[LadderLevel] = []
+        amounts: list[float] = []
+        for level in levels:
+            raw = math.floor(level.size * 10**decimals)
+            if raw <= 0:
+                continue
+            kept.append(level)
+            amounts.append(raw / 10**decimals)
+        return kept, amounts
+
     async def _deposit_ladder(self, ladder: list[LadderLevel]) -> None:
         """Initial deposit of single-sided positions."""
         self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would deposit %d levels", len(ladder))
             return
-        bids = [l for l in ladder if l.side == "bid"]
-        asks = [l for l in ladder if l.side == "ask"]
+        bids, bid_amounts = self._quantized_side(
+            [l for l in ladder if l.side == "bid" and l.size > 0], "bid", self.cfg.grid,
+        )
+        asks, ask_amounts = self._quantized_side(
+            [l for l in ladder if l.side == "ask" and l.size > 0], "ask", self.cfg.grid,
+        )
         # Deposit bid side (quote token below mid)
         if bids:
             req_id = self._next_req_id()
@@ -723,7 +809,7 @@ class Keeper:
                 "pool": self.cfg.pool_address,
                 "side": "bid",
                 "bin_ids": [l.bin_id for l in bids],
-                "amounts": [l.size for l in bids],
+                "amounts": bid_amounts,
                 "expected_active_bin": self._active_bin,
                 "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "strategy_type": "Spot",
@@ -735,9 +821,7 @@ class Keeper:
                 self._current_position_id = (
                     result.data.get("position_id") if result.data else None
                 ) or result.position_id
-                self._center_bin = min(l.bin_id for l in bids) + (
-                    max(l.bin_id for l in bids) - min(l.bin_id for l in bids)
-                ) // 2 if bids else self._active_bin
+                self._center_bin = self._active_bin  # drift anchor at deploy time
                 self.emit(
                     "position_created",
                     position_id=self._current_position_id,
@@ -758,7 +842,7 @@ class Keeper:
                 "pool": self.cfg.pool_address,
                 "side": "ask",
                 "bin_ids": [l.bin_id for l in asks],
-                "amounts": [l.size for l in asks],
+                "amounts": ask_amounts,
                 "expected_active_bin": self._active_bin,
                 "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "strategy_type": "Spot",
@@ -767,9 +851,21 @@ class Keeper:
             result = self.exec.deposit_single_sided(**payload)
             self._emit_result(req_id, "deposit_single_sided", result, "deposit_gas")
             if result.ok:
+                # The ask range is a distinct PDA from the bid position; track
+                # it so no ask-side liquidity is ever left unclosed.
+                ask_pid = (
+                    (result.data.get("position_id") if isinstance(result.data, dict) else None)
+                    or result.position_id
+                )
+                if (
+                    ask_pid
+                    and ask_pid != self._current_position_id
+                    and ask_pid not in self._extra_position_ids
+                ):
+                    self._extra_position_ids.append(ask_pid)
                 self.emit(
                     "position_liquidity_added",
-                    position_id=self._current_position_id,
+                    position_id=ask_pid or self._current_position_id,
                     min_bin_id=min(l.bin_id for l in asks),
                     max_bin_id=max(l.bin_id for l in asks),
                     bins=self._bin_payload(asks),
@@ -791,8 +887,18 @@ class Keeper:
             logger.warning("Cannot refresh: no current position_id")
             return
 
-        bids = [l for l in ladder if l.side == "bid"]
-        asks = [l for l in ladder if l.side == "ask"]
+        bids, bid_amounts = self._quantized_side(
+            [l for l in ladder if l.side == "bid" and l.size > 0], "bid", self.cfg.grid,
+        )
+        asks, ask_amounts = self._quantized_side(
+            [l for l in ladder if l.side == "ask" and l.size > 0], "ask", self.cfg.grid,
+        )
+
+        # The refresh re-deposits both sides; close any ask-side PDAs from the
+        # previous deployment first so the bundle replaces the whole ladder.
+        if self._extra_position_ids and not await self._withdraw_extra_positions("refresh_gas"):
+            logger.error("Refresh aborted: stale ask-side positions could not be withdrawn")
+            return
 
         req_id = self._next_req_id()
         payload = {
@@ -804,21 +910,20 @@ class Keeper:
                 "max_active_bin_slippage": self.cfg.max_active_bin_slippage,
                 "bid_bins": [l.bin_id for l in bids],
                 "ask_bins": [l.bin_id for l in asks],
-                "bid_amounts": [l.size for l in bids],
-                "ask_amounts": [l.size for l in asks],
+                "bid_amounts": bid_amounts,
+                "ask_amounts": ask_amounts,
             },
         }
         self._emit_action(req_id, "refresh_bundle", payload)
         result = self.exec.refresh_bundle(**payload)
         self._emit_result(req_id, "refresh_bundle", result, "refresh_gas")
         if result.ok:
-            center = min(l.bin_id for l in ladder if l.side == "bid") if bids else self._active_bin
-            self._center_bin = center
+            self._center_bin = self._active_bin  # drift anchor at deploy time
             old_pid = self._current_position_id
-            new_pid = (
-                result.data.get("position_id") if isinstance(result.data, dict) else None
-            ) or result.position_id or old_pid
             data = result.data if isinstance(result.data, dict) else {}
+            self._adopt_opened_positions(result)
+            new_pid = self._current_position_id or old_pid
+            # A close+open refresh returns new PDA(s); keep polling the live one.
             self.emit(
                 "position_withdrawn",
                 position_id=old_pid,
@@ -827,12 +932,13 @@ class Keeper:
                 amounts_returned=data.get("amounts_returned"),
                 **self._chain_fields(result),
             )
-            self.emit(
-                "position_liquidity_added",
-                position_id=new_pid,
-                bins=self._bin_payload(ladder),
-                **self._chain_fields(result),
-            )
+            for opened_id in [new_pid, *self._extra_position_ids]:
+                self.emit(
+                    "position_liquidity_added",
+                    position_id=opened_id,
+                    bins=self._bin_payload(ladder),
+                    **self._chain_fields(result),
+                )
             self._register_ladder(ladder, new_pid)
             logger.info("Refreshed ladder: %s", result.tx_signatures)
         else:
@@ -863,6 +969,7 @@ class Keeper:
                 )
                 logger.info("Stopped quoting: withdrew position %s", self._current_position_id)
                 self._current_position_id = None
+                await self._withdraw_extra_positions("stop_quoting_gas")
                 if self.swap_observer is not None:
                     self.swap_observer.clear()
             else:
@@ -894,6 +1001,7 @@ class Keeper:
                 **self._chain_fields(result),
             )
             self._current_position_id = None
+            await self._withdraw_extra_positions("de_risk_withdraw")
             if self.swap_observer is not None:
                 self.swap_observer.clear()
 
@@ -907,7 +1015,7 @@ class Keeper:
                 "out_mint": self.cfg.quote_mint,
                 "amount": self._inventory_base,
                 "max_slippage_bps": 100,
-                "pool": None,
+                "pool": self.cfg.pool_address,
             }
             self._emit_action(req_id, "swap", payload)
             result = self.exec.swap(**payload)
@@ -944,6 +1052,7 @@ class Keeper:
                 )
                 logger.critical("Emergency withdraw ok: %s", result.tx_signatures)
             self._current_position_id = None
+            await self._withdraw_extra_positions("emergency_withdraw")
             if self.swap_observer is not None:
                 self.swap_observer.clear()
         # Swap all base to quote (safe leg)
@@ -954,7 +1063,7 @@ class Keeper:
                 "out_mint": self.cfg.quote_mint,
                 "amount": self._inventory_base,
                 "max_slippage_bps": 200,  # accept 2% slippage in emergency
-                "pool": None,
+                "pool": self.cfg.pool_address,
             }
             self._emit_action(req_id, "swap", payload)
             result = self.exec.swap(**payload)

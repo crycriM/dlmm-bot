@@ -3,7 +3,7 @@
 The ``record_session`` fixture records a keeper run over in-memory state with
 a frozen wall-clock, producing a JSONL log that the replay/verify tests and
 PnL-explain tests can read back. Time is frozen so the recorded ``ts`` values
-are exact, which is what makes the Phase-4 deterministic replay reproducible.
+are exact and deterministic replay remains reproducible.
 """
 
 from __future__ import annotations
@@ -35,6 +35,35 @@ from dlmm_bot.swap_observer import SwapObserver
 _TOOLS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "tools"))
 
 EXECUTOR_DIR = Path(__file__).resolve().parents[2] / "solana-clmm-executor"
+
+
+def _synthetic_pubkey(seed: int) -> str:
+    """Return a valid, deterministic Solana public key owned by no test user."""
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    raw = bytes([seed]) * 32
+    value = int.from_bytes(raw, "big")
+    encoded = ""
+    while value:
+        value, remainder = divmod(value, 58)
+        encoded = alphabet[remainder] + encoded
+    return encoded
+
+
+TEST_WALLET_PUBKEY = _synthetic_pubkey(1)
+
+
+def _executor_fixture_addresses() -> tuple[str, str, str]:
+    """Read the public IDs required by the sibling's canonical offline fixtures."""
+    requests_path = EXECUTOR_DIR / "fixtures" / "requests.json"
+    if not requests_path.is_file():
+        # Collection must still work when the optional sibling is absent.
+        return tuple(_synthetic_pubkey(seed) for seed in (2, 3, 4))
+    requests = json.loads(requests_path.read_text(encoding="utf-8"))
+    swap = requests["swap"]
+    return requests["get_state"]["pool"], swap["in_mint"], swap["out_mint"]
+
+
+TEST_POOL_ADDRESS, TEST_BASE_MINT, TEST_QUOTE_MINT = _executor_fixture_addresses()
 
 
 def pytest_addoption(parser):
@@ -102,11 +131,11 @@ def executor_env(request, monkeypatch, tmp_path):
     if node is None or not (EXECUTOR_DIR / "dist" / "bridge.js").is_file():
         pytest.fail("Node and solana-clmm-executor/dist/bridge.js are required; run npm ci && npm run build")
     env = {
-        "SOLANA_RPC_URL": "http://127.0.0.1:1", "SOLANA_RPC_WRITE_URL": "http://127.0.0.1:1",
+        "SOLANA_RPC_URL": "http://localhost:1", "SOLANA_RPC_WRITE_URL": "http://localhost:1",
         "SOLANA_COMMITMENT": "confirmed", "WALLET_SIGNER": "kms", "DRY_RUN": "true",
-        "WALLET_PUBKEY": "11111111111111111111111111111111",
-        "POOL_ALLOWLIST": "11111111111111111111111111111111",
-        "MINT_ALLOWLIST": "So11111111111111111111111111111111111111112,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "WALLET_PUBKEY": TEST_WALLET_PUBKEY,
+        "POOL_ALLOWLIST": TEST_POOL_ADDRESS,
+        "MINT_ALLOWLIST": f"{TEST_BASE_MINT},{TEST_QUOTE_MINT}",
         "MAX_SOL_PER_TX": "0.5", "MAX_SOL_PER_RUN": "2", "MAX_SLIPPAGE_BPS": "50",
         "MAX_ACTIVE_BIN_SLIPPAGE_BINS": "3",
         "MAX_PRIORITY_FEE_LAMPORTS": "100000", "JITO_ENABLED": "false", "JITO_TIP_LAMPORTS": "0",
@@ -118,6 +147,17 @@ def executor_env(request, monkeypatch, tmp_path):
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return node, tmp_path
+
+
+@pytest.fixture
+def executor_addresses():
+    """Offline fixture public IDs shared with subprocess lifecycle tests."""
+    return {
+        "wallet": TEST_WALLET_PUBKEY,
+        "pool": TEST_POOL_ADDRESS,
+        "base_mint": TEST_BASE_MINT,
+        "quote_mint": TEST_QUOTE_MINT,
+    }
 
 
 @pytest.fixture

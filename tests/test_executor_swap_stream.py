@@ -1,10 +1,10 @@
-"""M3 gate 3 (spec §6): the TS swap stream feeds the Python observer.
+"""The TypeScript swap stream feeds the Python observer.
 
 The executor writes decoded swaps to ``SWAP_STREAM_PATH``; ``dlmm_bot``'s
 ``JsonlSwapEventSource`` tails that same file and ``SwapObserver`` turns each
 row into ``observed_trade`` / ``bin_fill`` events. This test drives the real
 ``dist/bridge.js`` to produce the file, then reads it with the real Python
-reader — the seam spec §6 exists to close.
+reader, covering the file-format seam between the two implementations.
 
 Rows are produced through the offline fixture entrypoint, so no RPC, websocket,
 or mainnet access is involved; what is exercised is the file format and the
@@ -61,7 +61,7 @@ def ts_rows(ts_stream_file):
 
 
 def test_executor_produces_rows_with_the_observed_contract(ts_rows):
-    """Every row carries the fields SwapObserver reads by name (spec §6)."""
+    """Every row carries the fields SwapObserver reads by name."""
     assert ts_rows, "the TS stream must decode at least one swap"
     for row in ts_rows:
         assert row["tx_signature"], "tx_signature is the dedupe key; never synthesized"
@@ -70,7 +70,7 @@ def test_executor_produces_rows_with_the_observed_contract(ts_rows):
         assert isinstance(row["prev_active_bin"], int)
         assert isinstance(row["new_active_bin"], int)
         assert row["pool"]
-        # Raw u64s are strings: they exceed JS safe-integer range (spec §5).
+        # Raw u64s are strings because they can exceed JavaScript's safe range.
         for key in ("amount_in_raw", "amount_out_raw"):
             if key in row:
                 assert isinstance(row[key], str) and row[key].isdigit()
@@ -124,7 +124,7 @@ def test_observer_emits_observed_trade_and_bin_fill(ts_rows, tmp_path):
 
 
 def test_dedupe_across_backfill_overlap(ts_rows, tmp_path):
-    """Spec §6: overlap is free because the observer dedupes by signature."""
+    """Backfill overlap is safe because the observer dedupes by signature."""
     path = tmp_path / "swaps.jsonl"
     rows = ts_rows + ts_rows  # a reconnect replays what the tail already saw
     with open(path, "w", encoding="utf-8") as fh:
@@ -143,7 +143,7 @@ def test_dedupe_across_backfill_overlap(ts_rows, tmp_path):
 
 
 def test_verify_log_completeness_is_green(ts_rows, ts_stream_file, tmp_path, verify_tool):
-    """Gate 3: the fixture's complete chain swap set matches the keeper log."""
+    """The fixture's complete chain swap set matches the keeper log."""
     pool = ts_rows[0]["pool"]
     log = EventLog(str(tmp_path / "verified.jsonl"), run_id="m3", config_hash="h")
     log.emit("run_started", pool_address=pool)

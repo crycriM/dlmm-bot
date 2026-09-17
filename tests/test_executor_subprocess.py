@@ -1,4 +1,4 @@
-"""Gate 1: built bridge with explicitly injected offline handlers."""
+"""Built bridge tests with explicitly injected offline handlers."""
 
 import asyncio
 import json
@@ -39,11 +39,27 @@ def test_execbridge_restarts_after_child_exit(executor_cli_bridge):
         stream.close()
 
 
-def test_keeper_position_lifecycle_and_receipt_logs(cfg, executor_cli_bridge, tmp_path):
+def test_keeper_tracks_ask_side_pda_in_dry_run(cfg, executor_cli_bridge):
+    # Two-sided ladder over the DRY_RUN executor: the ask leg must land in a
+    # distinct PDA the keeper tracks, or live ask liquidity is unclosable.
+    keeper = Keeper(cfg, executor_cli_bridge)
+    keeper._active_bin = 100
+    ladder = [LadderLevel(bin_id=98, side="bid", size=75), LadderLevel(bin_id=102, side="ask", size=0.5)]
+    try:
+        asyncio.run(keeper._deposit_ladder(ladder))
+        assert keeper._current_position_id == "stub_position_001"
+        assert keeper._extra_position_ids == ["stub_position_002_ask"]
+    finally:
+        keeper.stop()
+
+
+def test_keeper_position_lifecycle_and_receipt_logs(
+    cfg, executor_cli_bridge, executor_addresses, tmp_path,
+):
     cfg.dry_run = False  # Keeper sends writes; executor independently stays DRY_RUN=true.
     cfg.log_dir = str(tmp_path / "keeper-logs")
-    cfg.base_mint = "So11111111111111111111111111111111111111112"
-    cfg.quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    cfg.base_mint = executor_addresses["base_mint"]
+    cfg.quote_mint = executor_addresses["quote_mint"]
     keeper = Keeper(cfg, executor_cli_bridge)
     # `_deposit_ladder` is normally entered after `_cycle` has observed state.
     keeper._active_bin = 100

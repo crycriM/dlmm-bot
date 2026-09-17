@@ -1,7 +1,7 @@
 """
 Transaction-cost-aware hedging for DLMM exotic pairs.
 
-Two-timescale controller per the dlmm plan §6 / shared-arch §2.8:
+The controller operates on two timescales:
 1. MA + deadband (fee-optimal band surrogate, normal regime)
 2. Vol-scaled window + hard delta-cap backstop (tail regime)
 

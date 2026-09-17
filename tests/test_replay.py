@@ -1,4 +1,4 @@
-"""Deterministic replay (plan §7) and offline reconciliation (plan §6).
+"""Deterministic replay and offline reconciliation tests.
 
 ``record_session`` (conftest) records a full keeper run over a frozen clock;
 the replay tool must re-derive every decision and action from the log alone,

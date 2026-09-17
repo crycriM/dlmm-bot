@@ -1,5 +1,5 @@
 """
-Deterministic wall-clock for tests and log replay (dlmm-logging-plan §7).
+Deterministic wall-clock for tests and log replay.
 
 Freezes ``time.time()`` so a keeper cycle is a pure function of its inputs.
 A replayed keeper re-derives identical decisions when it is fed the recorded

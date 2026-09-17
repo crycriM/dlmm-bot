@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Offline reconciliation for a dlmm-bot run log (dlmm-logging-plan §6).
+Offline reconciliation for a dlmm-bot run log.
 
 Four readers of the same log, run offline (no live keeper required):
 

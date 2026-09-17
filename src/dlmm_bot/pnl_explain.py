@@ -1,5 +1,5 @@
 """
-PnL explain as a pure fold over the event log (dlmm-logging-plan §5).
+PnL explanation as a pure fold over the event log.
 
 `explain_run(events)` re-derives the full PnL breakdown from logged facts
 only — no in-memory keeper state:

@@ -9,7 +9,7 @@ Verbs:
   deposit_single_sided(pool, side, bins, amounts, expected_active_bin,
                        max_active_bin_slippage, strategy_type) → tx signatures
   withdraw(position_id, bps)                                   → tx signatures
-  swap(pool_or_jupiter, in_mint, out_mint, amount, max_slippage_bps) → swap result
+  swap(pool, in_mint, out_mint, amount, max_slippage_bps)       → swap result
   refresh_bundle(withdraw_pos, swap_spec, deposit_spec)        → bundle result
   get_state(pool)                                              → activeBin, bins, balances
   get_position(position_id)                                    → per-bin amounts, claimable fees (raw)
@@ -190,7 +190,7 @@ class ExecBridge:
         return self._send({"method": "get_state", "pool": pool})
 
     def get_position(self, position_id: str) -> ExecResult:
-        """dlmm-logging-plan §3: per-bin amounts + claimable fees (raw)."""
+        """Return per-bin amounts and raw claimable fees."""
         return self._send({"method": "get_position", "position_id": position_id})
 
     def deposit_single_sided(
@@ -228,8 +228,8 @@ class ExecBridge:
         in_mint: str,
         out_mint: str,
         amount: float,
+        pool: str,
         max_slippage_bps: int = 50,
-        pool: str | None = None,
     ) -> ExecResult:
         return self._send({
             "method": "swap",
@@ -281,7 +281,7 @@ class FakeExecBridge:
 
     def set_receipt(self, **fields):
         """Inject on-chain receipt fields (slot, fee_lamports, ...) into every
-        successful action result — mirrors the TS executor extension (§3)."""
+        successful action result returned by the fake executor."""
         self._receipt.update(fields)
 
     def set_next_result(self, ok: bool):
@@ -345,7 +345,7 @@ class FakeExecBridge:
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
         return self._record("withdraw", position_id=position_id, bps=bps)
 
-    def swap(self, in_mint, out_mint, amount, max_slippage_bps=50, pool=None) -> ExecResult:
+    def swap(self, in_mint, out_mint, amount, pool, max_slippage_bps=50) -> ExecResult:
         return self._record(
             "swap", in_mint=in_mint, out_mint=out_mint, amount=amount,
             max_slippage_bps=max_slippage_bps, pool=pool,
@@ -360,7 +360,7 @@ class FakeExecBridge:
 
 
 #
-# ReplayExecBridge — deterministic rerun (dlmm-logging-plan §7).
+# ReplayExecBridge — deterministic rerun from recorded events.
 #
 class ReplayExecBridge:
     """ExecBridge that replays a recorded run log.
@@ -486,7 +486,7 @@ class ReplayExecBridge:
         )
 
     def swap(
-        self, in_mint, out_mint, amount, max_slippage_bps=50, pool=None,
+        self, in_mint, out_mint, amount, pool, max_slippage_bps=50,
     ) -> ExecResult:
         self.calls.append({
             "method": "swap", "in_mint": in_mint, "out_mint": out_mint,

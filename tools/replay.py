@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Deterministic rerun of a recorded dlmm-bot run (dlmm-logging-plan §7).
+Deterministic rerun of a recorded dlmm-bot run.
 
 Load the log → rebuild the config from ``run_started`` (verifying its
 ``config_hash``) → re-instantiate a ``Keeper`` over a ``ReplayExecBridge`` fed
