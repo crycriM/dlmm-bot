@@ -115,8 +115,19 @@ class TestSpreadClamping:
         bids_wide = [l for l in levels_wide if l.side == "bid"]
         assert bids_wide[0].bin_id < bids_tight[0].bin_id
 
+def notional(grid, level):
+    """Level size in quote units (asks are sized in base)."""
+    return level.size * grid.price_from_bin(level.bin_id) if level.side == "ask" else level.size
+
+
 class TestSkew:
-    """Per-level sizes reflect inventory skew."""
+    """Per-level notionals reflect inventory skew."""
+
+    def test_ask_sized_in_base(self, grid):
+        cfg = LadderConfig(capital=1000.0, level_weight=0.2)
+        levels = build_ladder(grid, active_bin=100, r=150.0, S=150.0, half_spread=0.01, skew=0.0, cfg=cfg)
+        ask = next(l for l in levels if l.side == "ask")
+        assert ask.size == pytest.approx(100.0 / grid.price_from_bin(ask.bin_id))
 
     def test_zero_skew_equal_sizes(self, grid):
         """skew=0 → ask and bid sizes are equal."""
@@ -125,7 +136,7 @@ class TestSkew:
         bids = [l for l in levels if l.side == "bid"]
         asks = [l for l in levels if l.side == "ask"]
         for b, a in zip(bids, asks):
-            assert abs(b.size - a.size) < 1e-9
+            assert abs(notional(grid, b) - notional(grid, a)) < 1e-9
 
     def test_positive_skew_favors_asks(self, grid):
         """skew > 0 → ask sizes larger than bid sizes."""
@@ -134,7 +145,7 @@ class TestSkew:
         bids = [l for l in levels if l.side == "bid"]
         asks = [l for l in levels if l.side == "ask"]
         for b, a in zip(bids, asks):
-            assert a.size > b.size
+            assert notional(grid, a) > notional(grid, b)
 
     def test_negative_skew_favors_bids(self, grid):
         """skew < 0 → bid sizes larger than ask sizes."""
@@ -143,7 +154,7 @@ class TestSkew:
         bids = [l for l in levels if l.side == "bid"]
         asks = [l for l in levels if l.side == "ask"]
         for b, a in zip(bids, asks):
-            assert b.size > a.size
+            assert notional(grid, b) > notional(grid, a)
 
     def test_extreme_skew_all_to_one_side(self, grid):
         """skew=+0.99 → nearly all capital on asks."""
@@ -152,7 +163,7 @@ class TestSkew:
         bids = [l for l in levels if l.side == "bid"]
         asks = [l for l in levels if l.side == "ask"]
         for b, a in zip(bids, asks):
-            assert a.size > 50 * b.size
+            assert notional(grid, a) > 50 * notional(grid, b)
 
 class TestLadderStructure:
     """Basic structure and sorting."""

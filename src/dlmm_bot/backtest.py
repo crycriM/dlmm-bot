@@ -29,18 +29,17 @@ from collections import deque
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from mm_core.contracts import MarketSnapshot
-from mm_core.pnl import Fill, PnLLedger, CashFlow
-from mm_core.as_core import gueant_reservation_price, gueant_half_spread
-from mm_core.vol import VOLATILITY_MODELS
-from mm_core.regime import evaluate_regime, should_quote, GateConfig
-from mm_core.inventory import TwoTokenInventory, Caps
-from mm_core.risk_policy import RiskPolicy, RiskConfig, Decision
+from mm_core.pnl import Fill, PnLLedger
 from mm_core.markout import MarkoutTracker
+from mm_core.risk_policy import Decision
 
-from dlmm_bot.grid import VenueGrid
-from dlmm_bot.ladder import build_ladder, LadderConfig, LadderLevel
+from dlmm_bot.oracle import OracleBars
 from dlmm_bot.config import DLMMConfig
+from dlmm_bot.grid import VenueGrid
+from dlmm_bot.keeper import KeeperConfig, make_risk_policy, plan_cycle
+from dlmm_bot.risk_dlmm import DLMMRiskConfig, DLMMRiskPolicy
+
+GAS_COST = 0.00005  # per on-chain action, booked like the live keeper's gas line
 
 
 @dataclass
@@ -62,6 +61,7 @@ class LadderState:
     active: bool = False
     bin_levels: dict[int, float] = field(default_factory=dict)  # bin_id → size deposited
     center_bin: int = 0
+    widened: bool = False  # built under WIDEN; keeper refreshes on the transition only
     side: str = "bid"  # which side has liquidity at each bin
 
 
@@ -88,7 +88,11 @@ class BacktestResult:
 
 
 class DLMMBacktester:
-    """Event-replay backtester for the DLMM MM strategy."""
+    """Event-replay backtester for the DLMM MM strategy.
+
+    Decides through dlmm_bot.keeper.plan_cycle — the live keeper's exact
+    risk / regime / AS / ladder path — and simulates only the actuation.
+    """
 
     def __init__(
         self,
@@ -96,27 +100,38 @@ class DLMMBacktester:
         grid: VenueGrid,
         events: list[BinEvent],
         initial_capital: float = 1000.0,
+        keeper_cfg: KeeperConfig | None = None,
+        oracle: OracleBars | None = None,
+        gas_cost: float = GAS_COST,
     ):
         self.cfg = cfg
         self.grid = grid
         self.events = sorted(events, key=lambda e: e.ts)
         self.initial_capital = initial_capital
+        self.keeper_cfg = keeper_cfg or KeeperConfig(dlmm=cfg, grid=grid)
+        self.oracle = oracle  # preloaded bars; same regime input as a live oracle keeper
+        self.gas_cost = gas_cost  # quote units per on-chain action (see calibrate --gas-lamports)
 
-        # PnL ledger
-        self.pnl = PnLLedger(venue="meteora", symbol=grid.ref_price and "backtest" or "backtest")
-
-        # Markout tracker
+        # Same components, same construction as Keeper.__init__
+        self.pnl = PnLLedger(venue="meteora", symbol="backtest")
         self.markout = MarkoutTracker()
+        self.dlmm_risk = DLMMRiskPolicy(DLMMRiskConfig(pair_type=self.keeper_cfg.pair_type))
+        self.risk = make_risk_policy(self.keeper_cfg, self.dlmm_risk)
 
-        # Risk
-        self.risk = RiskPolicy(cfg=RiskConfig(gate=GateConfig()))
-
-        # Ladder state
         self.ladder_state = LadderState()
+        # Total holdings (wallet + deposited), what the live keeper reads as balances
+        self.base = 0.0
+        self.quote = 0.0
+        self.halted = False
+        self.decisions: list[Decision] = []
 
-        # Price history for regime
-        self._prices: deque = deque(maxlen=500)
-        self._ts: deque = deque(maxlen=500)
+        # Keeper parity: the live keeper samples the pool price once per
+        # refresh_interval, so the regime/σ history is that poll grid, not one
+        # sample per swap. _last_* is the latest observed price (end-of-run mark).
+        self._prices: deque = deque(maxlen=self.keeper_cfg.max_history)
+        self._ts: deque = deque(maxlen=self.keeper_cfg.max_history)
+        self._last_ts: float | None = None
+        self._last_mid: float | None = None
 
         # Results
         self._equity_curve: list[float] = []
@@ -129,20 +144,84 @@ class DLMMBacktester:
 
     def run(self) -> BacktestResult:
         """Run the backtest over all events."""
+        if self.events:
+            # Start 50/50 base/quote; the base leg is booked through the ledger
+            # at mid so its price risk shows up in PnL.
+            first = self.events[0]
+            mid = self.grid.price_from_bin(first.prev_active_bin)
+            self.base = self.initial_capital / 2.0 / mid
+            self.quote = self.initial_capital / 2.0
+            self.pnl.on_fill(Fill(ts=first.ts, side="buy", price=mid, size=self.base,
+                                  mid_at_fill=mid, label="initial_inventory"))
         for event in self.events:
+            if self.halted:  # live keeper halts after emergency exit
+                break
             self._process_event(event)
         return self._compute_result()
 
+    def _book_fill(self, fill: Fill) -> None:
+        self.pnl.on_fill(fill)
+        signed = fill.size if fill.side == "buy" else -fill.size
+        self.base += signed
+        self.quote -= signed * fill.price
+
+    def _gas(self, ts: float, label: str) -> None:
+        self.pnl.on_cash_flow("rebalance", ts, -self.gas_cost, label=label)
+        self.quote -= self.gas_cost
+
+    def _withdraw(self, ts: float, label: str) -> None:
+        if self.ladder_state.active:
+            self.ladder_state = LadderState()
+            self.n_refreshes += 1
+            self._gas(ts, label)
+
+    def _swap_base_out(self, ts: float, mid: float, min_base: float, label: str) -> None:
+        """ponytail: swap fills at mid, no price impact — add the sqrt impact
+        model once Jupiter swap fills are measured."""
+        if self.base > min_base:
+            self._book_fill(Fill(ts=ts, side="sell", price=mid, size=self.base,
+                                 mid_at_fill=mid, label=label))
+            self._gas(ts, label)
+
+    def _deploy(self, ts: float, active_bin: int, ladder, widened: bool = False) -> None:
+        # Ladder units: ask size is base, bid size is quote. Stored as base so
+        # fills match the SwapObserver rule.
+        levels = {}
+        for level in ladder:
+            if level.size <= 0:
+                continue
+            price = self.grid.price_from_bin(level.bin_id)
+            levels[level.bin_id] = level.size if level.side == "ask" else level.size / price
+        self.ladder_state = LadderState(active=True, bin_levels=levels, center_bin=active_bin,
+                                        widened=widened)
+        self.n_refreshes += 1
+        self._gas(ts, "refresh_gas")
+
+    def _sample_poll_grid(self, ts: float, mid: float) -> None:
+        """Poll-grid samples up to `ts`, each at the price prevailing then.
+
+        Grid points strictly before this swap saw the previous swap's price;
+        the current price reaches `plan_cycle` as the live observation.
+        """
+        step = self.keeper_cfg.refresh_interval
+        if self._last_ts is None:
+            self._ts.append(ts)
+            self._prices.append(mid)
+        else:
+            t = self._ts[-1] + step
+            while t < ts:
+                self._ts.append(t)
+                self._prices.append(self._last_mid)
+                t += step
+        self._last_ts, self._last_mid = ts, mid
+
     def _process_event(self, event: BinEvent) -> None:
-        """Process one bin-crossing event."""
+        """Process one bin-crossing event, then run one keeper cycle."""
         self.n_cycles += 1
         mid = self.grid.price_from_bin(event.active_bin)
         prev_mid = self.grid.price_from_bin(event.prev_active_bin)
-        self._prices.append(mid)
-        self._ts.append(event.ts)
+        self._sample_poll_grid(event.ts, mid)
         self.pnl.mark(event.ts, mid)
-
-        # Markout tracking
         self.markout.on_mid(event.ts, mid)
 
         # Determine which bins were crossed
@@ -153,122 +232,73 @@ class DLMMBacktester:
             crossed_bins = list(range(event.active_bin + 1, event.prev_active_bin + 1))
             self.n_down_crosses += 1
 
-        # Check fills at each crossed bin
+        # Up-cross fills asks (we sell base), down-cross fills bids (we buy base)
         for bin_id in crossed_bins:
+            size = self.ladder_state.bin_levels.get(bin_id, 0.0)
+            if size <= 0:
+                continue
             bin_price = self.grid.price_from_bin(bin_id)
-            if bin_id in self.ladder_state.bin_levels:
-                size = self.ladder_state.bin_levels[bin_id]
-                if size <= 0:
-                    continue
+            up = event.direction == "up"
+            fill = Fill(
+                ts=event.ts, side="sell" if up else "buy", price=bin_price, size=size,
+                mid_at_fill=prev_mid, label="bin_ask_cross" if up else "bin_bid_cross",
+            )
+            self._book_fill(fill)
+            self.markout.on_fill(event.ts, fill.side, fill.price, fill.size)
+            self.n_fills += 1
+            self.ladder_state.bin_levels[bin_id] = 0.0
 
-                # Determine fill side: up-cross fills asks (we sell base), down-cross fills bids (we buy base)
-                if event.direction == "up":
-                    # Ask side: we sold base at bin_price
-                    fill = Fill(
-                        ts=event.ts, side="sell", price=bin_price, size=size,
-                        mid_at_fill=prev_mid, label="bin_ask_cross",
-                    )
-                else:
-                    # Bid side: we bought base at bin_price
-                    fill = Fill(
-                        ts=event.ts, side="buy", price=bin_price, size=size,
-                        mid_at_fill=prev_mid, label="bin_bid_cross",
-                    )
-                self.pnl.on_fill(fill)
-                self.markout.on_fill(event.ts, fill.side, fill.price, fill.size)
-                self.n_fills += 1
+            # LP fee accrues only on crossed bins
+            fee_income = size * bin_price * event.fee_bps / 1e4
+            self.pnl.on_cash_flow("lp_fee", event.ts, fee_income, label=f"bin_{bin_id}_fee")
+            self.quote += fee_income
 
-                # Remove filled liquidity from this bin
-                self.ladder_state.bin_levels[bin_id] = 0.0
+        self._cycle(event, mid)
 
-                # Accrue LP fee (only on crossed bins)
-                fee_income = size * bin_price * event.fee_bps / 1e4
-                self.pnl.on_cash_flow("lp_fee", event.ts, fee_income, label=f"bin_{bin_id}_fee")
-
-        # Check if regime gate allows quoting
-        if len(self._prices) >= 2:
-            price_history = list(zip(self._ts, self._prices))
-            try:
-                regime = evaluate_regime(price_history)
-                should = should_quote(regime, GateConfig())
-            except Exception:
-                should = True
-
-            if not should:
-                # Stop quoting: withdraw
-                if self.ladder_state.active:
-                    self.ladder_state = LadderState()
-                    self.n_refreshes += 1
-                    self.pnl.on_cash_flow("rebalance", event.ts, -0.00005, label="stop_quoting_gas")
-                return
-
-        # Check if refresh needed (drift from center)
-        drift = abs(event.active_bin - self.ladder_state.center_bin)
-        if not self.ladder_state.active or drift >= 3:
-            self._refresh_ladder(event, mid)
-            self.n_refreshes += 1
-
-        # Track equity for drawdown
         equity = self.pnl.explain(event.ts, mid).total_pnl + self.initial_capital
         self._equity_curve.append(equity)
         self._peak_equity = max(self._peak_equity, equity)
 
-    def _refresh_ladder(self, event: BinEvent, mid: float) -> None:
-        """Build and deploy a new ladder."""
-        price_history = list(zip(self._ts, self._prices))
-        if len(price_history) < 2:
-            return
-
-        vol_model = VOLATILITY_MODELS["close_to_close"]
-        sigma = vol_model(price_history)
-
-        inventory = TwoTokenInventory(
-            base=0.0,  # simplified — from state in production
-            quote=0.0,
-            mid=mid,
-            target_base_share=0.5,
-            _caps=Caps(max_position=100.0, critical_position=90.0),
+    def _cycle(self, event: BinEvent, mid: float) -> None:
+        """Keeper._cycle steps 2-4 with simulated actuation."""
+        plan = plan_cycle(
+            self.keeper_cfg, self.risk, self.dlmm_risk, self.markout, self.pnl,
+            ts=event.ts, mid=mid, active_bin=event.active_bin,
+            inventory_base=self.base, inventory_quote=self.quote,
+            price_history=list(zip(self._ts, self._prices)) + [(event.ts, mid)],
+            tvl_usd=event.tvl_usd,
+            regime_history=self.oracle.regime_history(event.ts) if self.oracle else None,
         )
+        self.decisions.append(plan.decision)
 
-        r = gueant_reservation_price(
-            mid=mid, q=0.0, gamma=self.cfg.gamma,
-            sigma=sigma, kappa=self.cfg.kappa,
-        )
-        half_spread = gueant_half_spread(
-            gamma=self.cfg.gamma, sigma=sigma, kappa=self.cfg.kappa,
-        )
-
-        ladder = build_ladder(
-            grid=self.grid, active_bin=event.active_bin,
-            r=r, S=mid, half_spread=half_spread, skew=0.0,
-            cfg=LadderConfig(
-                levels=self.cfg.levels,
-                inner_offset=self.cfg.inner_offset,
-                capital=self.cfg.capital,
-                level_weight=self.cfg.level_weight,
-            ),
-        )
-
-        # Deploy ladder
-        new_levels = {}
-        for level in ladder:
-            new_levels[level.bin_id] = level.size
-
-        self.ladder_state = LadderState(
-            active=True,
-            bin_levels=new_levels,
-            center_bin=event.active_bin,
-        )
-
-        # Gas cost for refresh
-        self.pnl.on_cash_flow("rebalance", event.ts, -0.00005, label="refresh_gas")
+        if plan.decision == Decision.EMERGENCY_EXIT:
+            self._withdraw(event.ts, "emergency_withdraw")
+            self._swap_base_out(event.ts, mid, 0.001, "emergency_swap")
+            self.halted = True
+        elif plan.decision == Decision.DE_RISK:
+            self._withdraw(event.ts, "de_risk_withdraw")
+            self._swap_base_out(event.ts, mid, 0.01, "de_risk_swap")
+        elif plan.decision == Decision.STOP_QUOTING:
+            self._withdraw(event.ts, "stop_quoting_gas")
+        elif plan.decision == Decision.HOLD:
+            pass
+        else:
+            center = self.ladder_state.center_bin
+            drift = abs(event.active_bin - center) if center else 0
+            if (
+                not self.ladder_state.active
+                or drift >= self.keeper_cfg.drift_threshold_bins
+                or (plan.decision == Decision.WIDEN and not self.ladder_state.widened)
+            ):
+                self._deploy(event.ts, event.active_bin, plan.ladder,
+                             widened=plan.decision == Decision.WIDEN)
 
     def _compute_result(self) -> BacktestResult:
         """Compute final metrics."""
         breakdown = self.pnl.explain(
-            self._ts[-1] if self._ts else 0,
-            self._prices[-1] if self._prices else self.grid.ref_price,
-        ) if self._prices else None
+            self._last_ts,
+            self._last_mid,
+        ) if self._last_mid is not None else None
 
         total_pnl = breakdown.total_pnl if breakdown else 0.0
         spread = breakdown.spread_capture if breakdown else 0.0
@@ -296,7 +326,7 @@ class DLMMBacktester:
                 mean_ret = sum(returns) / len(returns)
                 var_ret = sum((r - mean_ret) ** 2 for r in returns) / max(len(returns) - 1, 1)
                 std_ret = math.sqrt(var_ret) if var_ret > 0 else 0
-                Sharpe = (mean_ret / std_ret * math.sqrt(365 * 24 * 3600 / self.cfg.refresh_interval)) if std_ret > 0 else 0.0
+                Sharpe = (mean_ret / std_ret * math.sqrt(365 * 24 * 3600 / self.keeper_cfg.refresh_interval)) if std_ret > 0 else 0.0
 
         # Fill rate
         fill_rate = self.n_fills / max(self.n_up_crosses + self.n_down_crosses, 1)

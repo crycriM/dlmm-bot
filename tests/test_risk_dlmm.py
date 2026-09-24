@@ -120,6 +120,17 @@ class TestInventoryCap:
         assert not breached
 
 
+    def test_quote_heavy_does_not_breach(self):
+        """De-risk ends all-quote; that must not re-trigger de-risk forever."""
+        rp = DLMMRiskPolicy(DLMMRiskConfig(pair_type=PairType.BLUECHIP, max_inventory_pct=80.0))
+        breached, _ = rp.check_inventory_cap(
+            base_inventory=0.0,
+            quote_inventory_in_base=100.0,
+            total_capital_base=100.0,
+        )
+        assert not breached
+
+
 class TestHalfLifeThreshold:
     def test_bluechip_tolerates_longer_half_life(self):
         rp_b = DLMMRiskPolicy(default_risk_config_for_pair(PairType.BLUECHIP))

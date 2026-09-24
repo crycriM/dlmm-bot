@@ -24,7 +24,7 @@ import math
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Callable, Optional
 
 from mm_core.contracts import MarketSnapshot, ExecIntent, QuoteSpec
@@ -32,7 +32,7 @@ from mm_core.inventory import TwoTokenInventory, Caps
 from mm_core.markout import MarkoutTracker
 from mm_core.pnl import Fill, PnLLedger
 from mm_core.risk_policy import Decision, RiskConfig, RiskPolicy
-from mm_core.regime import evaluate_regime, GateConfig, should_quote
+from mm_core.regime import evaluate_regime, GateConfig, Regime, should_quote
 from mm_core.as_core import gueant_reservation_price, gueant_half_spread
 from mm_core.vol import VOLATILITY_MODELS
 
@@ -44,6 +44,7 @@ from dlmm_bot.risk_dlmm import DLMMRiskPolicy, DLMMRiskConfig, PairType
 from dlmm_bot.hedge import HedgeController, HedgeConfig
 from dlmm_bot.event_log import EventLog, git_sha, _pkg_dir, _jsonable
 from dlmm_bot.swap_observer import SwapObserver
+from dlmm_bot.oracle import OracleBars
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,9 @@ class KeeperConfig:
     pool_address: str = ""
     dry_run: bool = True                # shadow mode: log decisions, don't submit tx
     observation_only: bool = False      # poll/log only; skip strategy and actuation
+    # False disables only the regime-triggered STOP_QUOTING (separate test arm,
+    # executor test plan §8.11); every other guard stays active.
+    regime_stop: bool = True
     position_id: str | None = None     # current LP position
     # A two-sided ladder lands in two distinct PDAs (bid and ask ranges never
     # share a position); the ask-side PDAs ride here so stop/refresh/emergency
@@ -81,7 +85,7 @@ class KeeperConfig:
 
 def dump_keeper_config(cfg: KeeperConfig) -> dict:
     """Deterministic, JSON-serializable config dump (run_started + config_hash)."""
-    return {
+    dump = {
         "dlmm": asdict(cfg.dlmm),
         "grid": {
             "ref_price": cfg.grid.ref_price,
@@ -99,6 +103,7 @@ def dump_keeper_config(cfg: KeeperConfig) -> dict:
             "pool_address": cfg.pool_address,
             "dry_run": cfg.dry_run,
             "observation_only": cfg.observation_only,
+            "regime_stop": cfg.regime_stop,
             "position_id": cfg.position_id,
             "extra_position_ids": list(cfg.extra_position_ids),
             "max_history": cfg.max_history,
@@ -109,6 +114,13 @@ def dump_keeper_config(cfg: KeeperConfig) -> dict:
             "gas_token_price_quote": cfg.gas_token_price_quote,
         },
     }
+    # regime_stop is dumped only when disabled, so every config written with
+    # the default keeps the config_hash it had before the flag existed.
+    if cfg.regime_stop and cfg.dlmm.gate.regime_stop and cfg.dlmm.risk.gate.regime_stop:
+        del dump["keeper"]["regime_stop"]
+        del dump["dlmm"]["gate"]["regime_stop"]
+        del dump["dlmm"]["risk"]["gate"]["regime_stop"]
+    return dump
 
 
 def hash_keeper_config(cfg: KeeperConfig) -> str:
@@ -144,6 +156,7 @@ def rebuild_keeper_config(dump: dict) -> KeeperConfig:
         pool_address=k.get("pool_address", ""),
         dry_run=k.get("dry_run", True),
         observation_only=k.get("observation_only", False),
+        regime_stop=k.get("regime_stop", True),
         position_id=k.get("position_id"),
         extra_position_ids=tuple(k.get("extra_position_ids", [])),
         max_history=k.get("max_history", 500),
@@ -179,6 +192,139 @@ class CycleRecord:
     dry_run: bool = True
     net_delta: float = 0.0
     sigma: float = 0.0
+    regime_state: str = "unknown"
+    regime_transition: str | None = None
+    regime_raw_open: bool | None = None
+    regime_provisional: bool = False
+    regime_sample_count: int | None = None
+    regime_sample_interval_s: float | None = None
+    regime_history_span_s: float | None = None
+
+
+def make_risk_policy(cfg: KeeperConfig, dlmm_risk: DLMMRiskPolicy) -> RiskPolicy:
+    """Shared RiskPolicy with the pair-type half-life gate (relaxed, and the
+    trend gate lifted, when an exotic-pair hedge is active)."""
+    hedge_active = bool(cfg.hedge_config and cfg.hedge_config.enabled)
+    gate = replace(
+        cfg.dlmm.gate,
+        max_half_life=dlmm_risk.get_half_life_threshold(hedge_active=hedge_active),
+        hedge_active=hedge_active,
+        regime_stop=cfg.regime_stop,
+    )
+    return RiskPolicy(cfg=replace(cfg.dlmm.risk, gate=gate))
+
+
+@dataclass
+class CyclePlan:
+    """What one keeper cycle decided, before any actuation."""
+    decision: Decision
+    urgency: str
+    early_exit: str = ""        # "rug_kill_switch" | "inventory_cap" | "" (policy ran)
+    reason: str = ""
+    regime: Regime | None = None
+    net_delta: float | None = None
+    total_inv_base: float = 0.0
+    sigma: float | None = None
+    r: float | None = None
+    half_spread: float | None = None
+    skew: float = 0.0
+    ladder: list[LadderLevel] | None = None  # set for QUOTE / WIDEN only
+
+
+def plan_cycle(
+    cfg: KeeperConfig,
+    risk_policy: RiskPolicy,
+    dlmm_risk: DLMMRiskPolicy,
+    markout: MarkoutTracker,
+    pnl: PnLLedger,
+    *,
+    ts: float,
+    mid: float,
+    active_bin: int,
+    inventory_base: float,
+    inventory_quote: float,
+    price_history: list[tuple[float, float]],
+    tvl_usd: float | None,
+    regime_history: list[tuple[float, float]] | None = None,
+) -> CyclePlan:
+    """DLMM risk -> regime -> shared RiskPolicy -> AS ladder. Pure w.r.t. the
+    venue (stateful only through the passed-in policies), so the live keeper
+    and the backtester decide through the exact same code.
+
+    `regime_history` (oracle bar closes, see `dlmm_bot.oracle`) replaces the
+    pool's own poll samples for the regime gate and σ when the pool ticks
+    too rarely to estimate them; the ladder still centres on the pool price."""
+    signal_history = regime_history if regime_history is not None else price_history
+    kill, kill_reason = dlmm_risk.evaluate_tvl(ts, tvl_usd)
+    if kill:
+        return CyclePlan(Decision.EMERGENCY_EXIT, "emergency", "rug_kill_switch", kill_reason)
+
+    inv_cap_breached, inv_reason = dlmm_risk.check_inventory_cap(
+        inventory_base,
+        inventory_quote / mid if mid > 0 else 0.0,
+        cfg.dlmm.capital / mid if mid > 0 else 0.0,
+    )
+    if inv_cap_breached:
+        return CyclePlan(Decision.DE_RISK, "normal", "inventory_cap", inv_reason)
+
+    # An explicitly configured oracle with no closed bars is a feed outage,
+    # not ordinary estimator warm-up. Keep the DLMM fail-closed until a
+    # timestamped oracle observation is available again.
+    if regime_history is not None and not regime_history:
+        return CyclePlan(Decision.STOP_QUOTING, "immediate", reason="oracle_stale")
+
+    regime = evaluate_regime(signal_history)
+    inventory = TwoTokenInventory(
+        base=inventory_base,
+        quote=inventory_quote,
+        mid=mid,
+        target_base_share=0.5,
+        _caps=Caps(max_position=cfg.dlmm.capital * 0.8 / mid, critical_position=cfg.dlmm.capital * 0.9 / mid),
+    )
+    equity = pnl.explain(ts, mid).total_pnl + cfg.dlmm.capital
+    decision, urgency = risk_policy.evaluate(
+        ts=ts, mid=mid, equity=equity,
+        inventory=inventory, regime=regime,
+        avg_markout_bps=markout.avg_markout_bps(30.0),
+    )
+    plan = CyclePlan(decision, urgency, regime=regime, net_delta=inventory.net_delta())
+    if not risk_policy.cfg.gate.regime_stop and not should_quote(regime, risk_policy.cfg.gate):
+        plan.reason = "regime_stop_disabled"  # the gate would have stopped here
+    if decision not in (Decision.QUOTE, Decision.WIDEN):
+        return plan
+
+    vol_model = VOLATILITY_MODELS.get(
+        getattr(cfg.dlmm, "vol_model", "close_to_close"),
+        VOLATILITY_MODELS["close_to_close"],
+    )
+    plan.sigma = vol_model(signal_history)
+    plan.r = gueant_reservation_price(
+        mid=mid, q=plan.net_delta, gamma=cfg.dlmm.gamma,
+        sigma=plan.sigma, kappa=cfg.dlmm.kappa,
+    )
+    plan.half_spread = gueant_half_spread(
+        gamma=cfg.dlmm.gamma, sigma=plan.sigma, kappa=cfg.dlmm.kappa,
+    )
+
+    # Skew from inventory error
+    plan.total_inv_base = inventory_base + (inventory_quote / mid if mid > 0 else 0)
+    base_share = inventory_base / plan.total_inv_base if plan.total_inv_base > 0 else 0.5
+    plan.skew = max(-1.0, min(1.0, 2.0 * (base_share - 0.5)))
+
+    if decision == Decision.WIDEN:
+        plan.half_spread *= 2.0  # widen factor
+
+    plan.ladder = build_ladder(
+        grid=cfg.grid, active_bin=active_bin, r=plan.r, S=mid,
+        half_spread=plan.half_spread, skew=plan.skew,
+        cfg=LadderConfig(
+            levels=cfg.dlmm.levels,
+            inner_offset=cfg.dlmm.inner_offset,
+            capital=cfg.dlmm.capital,
+            level_weight=cfg.dlmm.level_weight,
+        ),
+    )
+    return plan
 
 
 class Keeper:
@@ -193,6 +339,7 @@ class Keeper:
         swap_observer: "SwapObserver | None" = None,
         sentinel_reader: Callable[[str], tuple[bool, str | None]] | None = None,
         sentinel_clearer: Callable[[str], None] | None = None,
+        oracle: OracleBars | None = None,
     ):
         if (
             isinstance(cfg.max_active_bin_slippage, bool)
@@ -210,14 +357,13 @@ class Keeper:
         self._owns_log = False
         self._sentinel_reader = sentinel_reader or self._read_sentinel
         self._sentinel_clearer = sentinel_clearer or os.remove
+        self.oracle = oracle
 
         # Price history for regime/vol estimation
         self._price_history: deque = deque(maxlen=cfg.max_history)
         self._ts_history: deque = deque(maxlen=cfg.max_history)
 
         # mm_core components
-        risk_cfg = RiskConfig(gate=GateConfig())
-        self.risk_policy = RiskPolicy(cfg=risk_cfg)
         self.markout = MarkoutTracker()
         self.pnl = PnLLedger(venue="meteora", symbol=cfg.pool_address or "unknown")
 
@@ -229,11 +375,15 @@ class Keeper:
         self.hedge: HedgeController | None = None
         if cfg.hedge_config and cfg.hedge_config.enabled:
             self.hedge = HedgeController(cfg.hedge_config)
+        self.risk_policy = make_risk_policy(cfg, self.dlmm_risk)
 
         # State
         self._running = False
         self._active_bin: int = 0
         self._center_bin: int = 0  # last deployed center
+        # Whether the deployed ladder was built under WIDEN: a WIDEN cycle
+        # refreshes only on the transition, not every 5 s while it persists.
+        self._deployed_widened: bool = False
         self._current_position_id: str | None = cfg.position_id
         self._extra_position_ids: list[str] = list(cfg.extra_position_ids)
         self._inventory_base: float = 0.0
@@ -284,6 +434,14 @@ class Keeper:
     def _next_req_id(self) -> str:
         self._req_counter += 1
         return f"req_{self._req_counter:06d}"
+
+    def _oracle_history(self, ts: float) -> list[tuple[float, float]] | None:
+        """Oracle closes for the regime gate, or None to use pool samples."""
+        if self.oracle is None:
+            return None
+        if self.oracle.stale(ts):
+            logger.warning("Oracle bars stale at %.0f; regime gate closed", ts)
+        return self.oracle.regime_history(ts)
 
     @staticmethod
     def _read_sentinel(path: str) -> tuple[bool, str | None]:
@@ -474,55 +632,37 @@ class Keeper:
         # TVL from state (if available from bus publisher)
         tvl_usd = state.get("tvl_usd")
 
-        # 2. DLMM-specific risk checks (rug, TVL, inventory caps)
-        kill, kill_reason = self.dlmm_risk.evaluate_tvl(ts, tvl_usd)
-        if kill:
-            logger.critical("Rug kill-switch: %s", kill_reason)
+        if self.oracle is not None:
+            try:
+                await asyncio.to_thread(self.oracle.refresh, ts)
+            except Exception as exc:  # feed outage: bars go stale, gate closes
+                logger.warning("Oracle refresh failed: %s", exc)
+
+        # 2-3. DLMM risk + regime + AS + shared risk policy (pure, shared with backtest)
+        plan = plan_cycle(
+            self.cfg, self.risk_policy, self.dlmm_risk, self.markout, self.pnl,
+            ts=ts, mid=mid, active_bin=self._active_bin,
+            inventory_base=self._inventory_base, inventory_quote=self._inventory_quote,
+            price_history=list(zip(self._ts_history, self._price_history)),
+            tvl_usd=tvl_usd,
+            regime_history=self._oracle_history(ts),
+        )
+        if plan.early_exit == "rug_kill_switch":
+            logger.critical("Rug kill-switch: %s", plan.reason)
             await self._emergency_exit()
             return self._finish_cycle(self._make_record(
                 ts, Decision.EMERGENCY_EXIT, "emergency", "rug_kill_switch",
-                mid=mid, refresh_reason=kill_reason,
+                mid=mid, refresh_reason=plan.reason,
             ))
-
-        inv_cap_breached, inv_reason = self.dlmm_risk.check_inventory_cap(
-            self._inventory_base,
-            self._inventory_quote / mid if mid > 0 else 0.0,
-            self.cfg.dlmm.capital / mid if mid > 0 else 0.0,
-        )
-        if inv_cap_breached:
-            logger.warning("Inventory cap breached: %s", inv_reason)
+        if plan.early_exit == "inventory_cap":
+            logger.warning("Inventory cap breached: %s", plan.reason)
             await self._de_risk()
             return self._finish_cycle(self._make_record(
                 ts, Decision.DE_RISK, "normal", "inventory_cap",
-                mid=mid, refresh_reason=inv_reason,
+                mid=mid, refresh_reason=plan.reason,
             ))
-
-        # 3. Regime + AS + shared risk policy
-        price_history = list(zip(self._ts_history, self._price_history))
-        regime = evaluate_regime(price_history)
-        self._last_regime = regime  # persisted for _make_record + event log
-        # Adjust gate for pair type
-        gate = GateConfig(
-            max_half_life=self.dlmm_risk.get_half_life_threshold(
-                hedge_active=self.hedge is not None
-            ),
-        )
-
-        inventory = TwoTokenInventory(
-            base=self._inventory_base,
-            quote=self._inventory_quote,
-            mid=mid,
-            target_base_share=0.5,
-            _caps=Caps(max_position=self.cfg.dlmm.capital * 0.8 / mid, critical_position=self.cfg.dlmm.capital * 0.9 / mid),
-        )
-
-        equity = self.pnl.explain(ts, mid).total_pnl + self.cfg.dlmm.capital
-        avg_markout = self.markout.avg_markout_bps(30.0)
-        decision, urgency = self.risk_policy.evaluate(
-            ts=ts, mid=mid, equity=equity,
-            inventory=inventory, regime=regime,
-            avg_markout_bps=avg_markout,
-        )
+        regime = self._last_regime = plan.regime  # persisted for _make_record + event log
+        decision, urgency = plan.decision, plan.urgency
 
         # 4. Actuate
         action = "none"
@@ -538,49 +678,12 @@ class Keeper:
         elif decision == Decision.DE_RISK:
             await self._de_risk()
             action = "de_risk"
+        elif decision == Decision.HOLD:
+            action = "hold"
         else:
-            # QUOTE or WIDEN: build ladder and check if refresh needed
-            vol_model = VOLATILITY_MODELS.get(
-                self.cfg.dlmm.vol_model if hasattr(self.cfg.dlmm, 'vol_model') else "close_to_close",
-                VOLATILITY_MODELS["close_to_close"],
-            )
-            sigma = vol_model(price_history)
-
-            r = gueant_reservation_price(
-                mid=mid,
-                q=inventory.net_delta(),
-                gamma=self.cfg.dlmm.gamma,
-                sigma=sigma,
-                kappa=self.cfg.dlmm.kappa,
-            )
-            half_spread = gueant_half_spread(
-                gamma=self.cfg.dlmm.gamma,
-                sigma=sigma,
-                kappa=self.cfg.dlmm.kappa,
-            )
-
-            # Skew from inventory error
-            total_inv_base = self._inventory_base + (self._inventory_quote / mid if mid > 0 else 0)
-            base_share = self._inventory_base / total_inv_base if total_inv_base > 0 else 0.5
-            skew = max(-1.0, min(1.0, 2.0 * (base_share - 0.5)))
-
-            if decision == Decision.WIDEN:
-                half_spread *= 2.0  # widen factor
-
-            ladder = build_ladder(
-                grid=self.cfg.grid,
-                active_bin=self._active_bin,
-                r=r,
-                S=mid,
-                half_spread=half_spread,
-                skew=skew,
-                cfg=LadderConfig(
-                    levels=self.cfg.dlmm.levels,
-                    inner_offset=self.cfg.dlmm.inner_offset,
-                    capital=self.cfg.dlmm.capital,
-                    level_weight=self.cfg.dlmm.level_weight,
-                ),
-            )
+            # QUOTE or WIDEN: ladder already built by plan_cycle
+            ladder, r, half_spread = plan.ladder, plan.r, plan.half_spread
+            skew, sigma, total_inv_base = plan.skew, plan.sigma, plan.total_inv_base
 
             # Ladder midpoint is for the record; drift compares the deploy-time
             # active bin against the current one (AS re-centres the ladder, so
@@ -595,17 +698,17 @@ class Keeper:
                 refresh_needed = True
                 refresh_reason = "initial_deposit"
                 action = "initial_deposit"
-                await self._deposit_ladder(ladder)
+                await self._deposit_ladder(ladder, widened=decision == Decision.WIDEN)
             elif drift >= self.cfg.drift_threshold_bins:
                 refresh_needed = True
                 refresh_reason = f"drift_{drift}_bins"
                 action = "refresh"
-                await self._refresh_ladder(ladder)
-            elif decision == Decision.WIDEN:
+                await self._refresh_ladder(ladder, widened=decision == Decision.WIDEN)
+            elif decision == Decision.WIDEN and not self._deployed_widened:
                 refresh_needed = True
                 refresh_reason = "widen_spread"
                 action = "refresh_widen"
-                await self._refresh_ladder(ladder)
+                await self._refresh_ladder(ladder, widened=True)
             else:
                 action = "hold"
 
@@ -629,7 +732,7 @@ class Keeper:
                 center_bin=center_bin if 'center_bin' in dir() else self._active_bin,
                 refresh_reason=refresh_reason,
                 refresh_needed=refresh_needed,
-                net_delta=inventory.net_delta(),
+                net_delta=plan.net_delta,
                 sigma=sigma,
             )
             self._log_decision(record, skew=skew, ladder=ladder)
@@ -790,7 +893,7 @@ class Keeper:
             amounts.append(raw / 10**decimals)
         return kept, amounts
 
-    async def _deposit_ladder(self, ladder: list[LadderLevel]) -> None:
+    async def _deposit_ladder(self, ladder: list[LadderLevel], widened: bool = False) -> None:
         """Initial deposit of single-sided positions."""
         self._ensure_run_started()
         if self.cfg.dry_run:
@@ -822,6 +925,7 @@ class Keeper:
                     result.data.get("position_id") if result.data else None
                 ) or result.position_id
                 self._center_bin = self._active_bin  # drift anchor at deploy time
+                self._deployed_widened = widened
                 self.emit(
                     "position_created",
                     position_id=self._current_position_id,
@@ -877,7 +981,7 @@ class Keeper:
 
         self._register_ladder(ladder, self._current_position_id)
 
-    async def _refresh_ladder(self, ladder: list[LadderLevel]) -> None:
+    async def _refresh_ladder(self, ladder: list[LadderLevel], widened: bool = False) -> None:
         """Refresh: withdraw → optional swap → redeposit via Jito bundle."""
         self._ensure_run_started()
         if self.cfg.dry_run:
@@ -919,6 +1023,7 @@ class Keeper:
         self._emit_result(req_id, "refresh_bundle", result, "refresh_gas")
         if result.ok:
             self._center_bin = self._active_bin  # drift anchor at deploy time
+            self._deployed_widened = widened
             old_pid = self._current_position_id
             data = result.data if isinstance(result.data, dict) else {}
             self._adopt_opened_positions(result)
@@ -1082,6 +1187,7 @@ class Keeper:
         net_delta: float = 0.0, sigma: float = 0.0,
     ) -> CycleRecord:
         regime = self._last_regime
+        gate = self.risk_policy.last_regime_gate
         return CycleRecord(
             ts=ts,
             active_bin=self._active_bin,
@@ -1104,6 +1210,13 @@ class Keeper:
             dry_run=self.cfg.dry_run,
             net_delta=net_delta,
             sigma=sigma,
+            regime_state=gate.state.value if gate else "unknown",
+            regime_transition=gate.transition if gate else None,
+            regime_raw_open=gate.raw_open if gate else None,
+            regime_provisional=gate.provisional if gate else False,
+            regime_sample_count=getattr(regime, "sample_count", None),
+            regime_sample_interval_s=getattr(regime, "sample_interval_s", None),
+            regime_history_span_s=getattr(regime, "history_span_s", None),
         )
 
     def _log_decision(

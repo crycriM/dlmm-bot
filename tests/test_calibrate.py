@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import calibrate  # noqa: E402
 
 from dlmm_bot.config import DLMMConfig  # noqa: E402
+from dlmm_bot.backtest import BinEvent  # noqa: E402
 from dlmm_bot.grid import VenueGrid  # noqa: E402
 
 
@@ -78,13 +79,47 @@ class TestCalibrate:
         report = calibrate.calibrate(events, grid, cfg, [1.0, 30.0], [0.5, 20.0], 0.5)
         assert report["n_in_sample"] == report["n_out_sample"] == 3
         assert report["n_crossings"] == 6
-        # The in-sample winner is reported at its out-of-sample cell, so the
-        # overfit gap is always visible.
-        for key in ("gamma", "kappa"):
-            assert report["chosen_out_of_sample"][key] == report["best_in_sample"][key]
+        # No parameter cell may masquerade as calibrated without in-sample
+        # fills. (Whether this tiny capture fills depends on the regime gate,
+        # so assert the invariant, not the fixture's fill count.)
+        assert report["calibrated"] is report["has_in_sample_fills"]
+        assert (report["chosen_out_of_sample"] is None) is not report["calibrated"]
         assert report["best_out_of_sample"]["total_pnl"] >= \
-            report["chosen_out_of_sample"]["total_pnl"]
+            max(row["total_pnl"] for row in report["out_of_sample"])
         assert isinstance(report["any_fills"], bool)
+
+    def test_selects_best_filling_cell_not_no_fill_pnl_winner(self, monkeypatch):
+        grid, cfg = self._bits()
+        is_rows = [
+            {"gamma": 1.0, "kappa": 0.5, "n_fills": 0, "total_pnl": 100.0},
+            {"gamma": 30.0, "kappa": 20.0, "n_fills": 1, "total_pnl": 1.0},
+        ]
+        oos_rows = [
+            {"gamma": 1.0, "kappa": 0.5, "n_fills": 0, "total_pnl": 50.0},
+            {"gamma": 30.0, "kappa": 20.0, "n_fills": 2, "total_pnl": 2.0},
+        ]
+        sweeps = iter((is_rows, oos_rows))
+        monkeypatch.setattr(calibrate, "sweep", lambda *args: next(sweeps))
+
+        events = [
+            BinEvent(
+                ts=1000.0 + i,
+                pool="POOL",
+                active_bin=i + 1,
+                prev_active_bin=i,
+                direction="up",
+                trade_size_usd=1.0,
+                fee_bps=0.0,
+            )
+            for i in range(2)
+        ]
+        report = calibrate.calibrate(
+            events, grid, cfg, [1.0, 30.0], [0.5, 20.0], 0.5
+        )
+
+        assert report["calibrated"] is True
+        assert report["best_in_sample"]["gamma"] == 30.0
+        assert report["chosen_out_of_sample"]["n_fills"] == 2
 
     def test_flags_a_capture_that_never_fills(self, tmp_path):
         """A capture with no bin crossings calibrates nothing, and says so."""

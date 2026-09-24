@@ -131,12 +131,12 @@ class DLMMRiskPolicy:
         if total <= 0:
             return False, ""
 
-        # Check if either side exceeds max_inventory_pct
+        # Only base over-exposure is a de-risk trigger: de-risk swaps into the
+        # quote (safe) leg, so a quote-side cap would re-trigger forever.
+        # Quote-heavy inventory is rebalanced by the ladder skew instead.
         max_base = total_capital_base * self.cfg.max_inventory_pct / 100.0
         if abs(base_inventory) > max_base:
             return True, f"Base inventory {base_inventory:.4f} exceeds cap {max_base:.4f}"
-        if abs(quote_inventory_in_base) > max_base:
-            return True, f"Quote inventory {quote_inventory_in_base:.4f} exceeds cap {max_base:.4f}"
 
         return False, ""
 

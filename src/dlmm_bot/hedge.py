@@ -1,5 +1,5 @@
 """
-Transaction-cost-aware hedging for DLMM exotic pairs.
+Transaction-cost-aware hedging for DLMM pairs.
 
 The controller operates on two timescales:
 1. MA + deadband (fee-optimal band surrogate, normal regime)

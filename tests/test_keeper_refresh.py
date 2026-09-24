@@ -113,3 +113,21 @@ class TestDriftRefresh:
         # period (~4 times in 24 cycles); the pre-fix keeper refreshed every
         # cycle (24+).
         assert 1 <= _refresh_calls(bridge) <= 8
+
+
+class TestWidenRefresh:
+    def test_persistent_widen_refreshes_once_not_every_cycle(self):
+        """WIDEN used to send a real refresh_bundle on every 5 s cycle while
+        markout stayed toxic (2026-09-22: 2,050 of 2,162 backtest redeploys)."""
+        from mm_core.risk_policy import Decision
+
+        keeper, bridge = _keeper()
+        # Make the initial ladder a normal QUOTE deployment. The real keeper
+        # now deploys WIDEN during estimator warm-up, so this test isolates the
+        # later QUOTE -> persistent WIDEN transition.
+        keeper.risk_policy.evaluate = lambda **_: (Decision.QUOTE, "passive")
+        deposited_at = _drive(keeper, bridge, amplitude=1, cycles_after_position=0)
+        assert deposited_at is not None
+        keeper.risk_policy.evaluate = lambda **_: (Decision.WIDEN, "passive")
+        _drive(keeper, bridge, amplitude=1, cycles_after_position=12)
+        assert _refresh_calls(bridge) == 1

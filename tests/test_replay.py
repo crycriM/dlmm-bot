@@ -12,7 +12,7 @@ import json
 
 from dlmm_bot.event_log import EventLog, ReplayLog, load_events
 
-# 8 cycles: regime warms up (stop quoting) → initial deposit → refreshes
+# 8 cycles: regime warms up (widen) → initial deposit → one drift refresh
 ACTIVES = [100, 100, 101, 101, 102, 102, 103, 103]
 
 
@@ -89,13 +89,12 @@ class TestRecordedSession:
                 n_obs += e["event_type"] == "position_observation"
                 assert e["position_id"] == "POS_1"
                 assert e["seq"] > created_seq
-        # observations happen on cycles that begin with a live position; in
-        # this session every such cycle then ends in a stop-quoting withdraw,
-        # while the final open position (deposited on the last cycle) is never
-        # observed — so observation and withdrawal counts are equal
+        # Observations happen on cycles that begin with a live position. The
+        # widened warm-up ladder stays live; only the later bin drift refresh
+        # withdraws it, so one withdrawal is expected for seven observations.
         withdrawals = [e for e in evs if e["event_type"] == "position_withdrawn"]
         assert n_obs >= 1
-        assert len(withdrawals) == n_obs
+        assert len(withdrawals) == 1
 
 
 class TestDeterministicReplay:
@@ -122,12 +121,15 @@ class TestDeterministicReplay:
             e for e in load_events(path) if e["event_type"] == "decision"
         ]
         actions = [d["action"] for d in decisions]
-        # golden shape: regime gate holds the first 3 cycles, then the
-        # deposit/stop-quoting alternation on a trending price series
-        assert actions[0:4] == ["stop_quoting"] * 3 + ["initial_deposit"]
-        assert all(a in ("stop_quoting", "initial_deposit", "refresh")
+        # Golden shape: warm-up widens and deploys once, then the ladder is
+        # held until the active-bin drift causes one refresh.
+        assert actions == [
+            "initial_deposit", "hold", "hold", "hold",
+            "hold", "hold", "refresh", "hold",
+        ]
+        assert all(a in ("initial_deposit", "hold", "refresh")
                    for a in actions[4:])
-        assert all(d["decision"] in ("stop_quoting", "quote") for d in decisions)
+        assert all(d["decision"] == "widen" for d in decisions)
 
     def test_tampered_log_fails_replay(self, record_session, replay_tool, tmp_path):
         path, _ = _record(record_session, tmp_path)

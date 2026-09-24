@@ -8,7 +8,10 @@ AS mapping:
     center = active_bin + round((r - S) / bin_width_in_bins)
     inner_offset = round(half_spread / bin_width_in_bins)
     ask_frac = 0.5 * (1 + skew),  bid_frac = 1 - ask_frac
-    per-level size = capital * side_frac * level_weight
+    per-level notional = capital * side_frac * level_weight  (quote units)
+
+Level sizes are in the token the level deposits: bids in quote, asks in
+base (notional / ask-bin price) — the units keeper._bin_payload sends.
 """
 
 import math
@@ -19,7 +22,7 @@ from dlmm_bot.grid import VenueGrid
 class LadderLevel:
     bin_id: int
     side: str          # "bid" | "ask"
-    size: float
+    size: float        # bid: quote units, ask: base units
 
 @dataclass
 class LadderConfig:
@@ -71,7 +74,7 @@ def build_ladder(
         levels.append(LadderLevel(bin_id=bid_bin, side="bid", size=bid_size))
         # Ask side: center + i * inner
         ask_bin = center + i * inner
-        ask_size = cfg.capital * ask_frac * weight
+        ask_size = cfg.capital * ask_frac * weight / grid.price_from_bin(ask_bin)
         levels.append(LadderLevel(bin_id=ask_bin, side="ask", size=ask_size))
 
     return sorted(levels, key=lambda l: l.bin_id)
