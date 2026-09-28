@@ -61,6 +61,17 @@ class TestLoadEvents:
         (event,) = calibrate.load_events(str(path), 9, 6)
         assert event.active_bin == event.prev_active_bin == 7
 
+    def test_flat_rows_size_from_the_quote_leg_whatever_was_paid(self, tmp_path):
+        # Flat rows all say "down"; the paid token comes from the implied price.
+        rows = [_row(0, 3, 2_000_000_000, 20_000_000, ts=1.0),       # sets price 1e5
+                _row(3, 3, 1_000_000_000, 10_000_000, ts=2.0),       # quote paid in
+                _row(3, 3, 10_000_000, 1_000_000_000, ts=3.0)]       # base paid in
+        path = tmp_path / "flat.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        _, quote_in, base_in = calibrate.load_events(str(path), 9, 6)
+        assert quote_in.trade_size_usd == pytest.approx(1000.0)
+        assert base_in.trade_size_usd == pytest.approx(1000.0)
+
     def test_pool_filter(self, capture):
         assert calibrate.load_events(capture, 9, 6, pool="OTHER") == []
 

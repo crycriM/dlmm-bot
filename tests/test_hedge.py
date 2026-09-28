@@ -64,7 +64,7 @@ class TestEvaluateActions:
         action, target, intent = hc.evaluate(
             inventory_base=10.0,
             current_short=10.0,
-            inventory_value_usd=1500.0,
+            inventory_value_usd=1500.0, price=150.0,
             sigma_now=0.5,
             dt=1.0,
         )
@@ -78,7 +78,7 @@ class TestEvaluateActions:
         action, target, intent = hc.evaluate(
             inventory_base=20.0,
             current_short=0.0,
-            inventory_value_usd=3000.0,
+            inventory_value_usd=3000.0, price=150.0,
             sigma_now=0.5,
             dt=1.0,
         )
@@ -94,7 +94,7 @@ class TestEvaluateActions:
         action, target, intent = hc.evaluate(
             inventory_base=100.0,
             current_short=0.0,
-            inventory_value_usd=15000.0,
+            inventory_value_usd=15000.0, price=150.0,
             sigma_now=0.5,
             dt=1.0,
         )
@@ -107,7 +107,7 @@ class TestEvaluateActions:
         hc = HedgeController(cfg)
         action, _, intent = hc.evaluate(
             inventory_base=1000.0, current_short=0.0,
-            inventory_value_usd=100000.0,
+            inventory_value_usd=100000.0, price=150.0,
         )
         assert action == "no_trade"
         assert intent is None
@@ -119,7 +119,7 @@ class TestHedgeState:
         hc = HedgeController(cfg)
         hc.evaluate(
             inventory_base=5.0, current_short=0.0,
-            inventory_value_usd=750.0, sigma_now=0.5, dt=1.0,
+            inventory_value_usd=750.0, price=150.0, sigma_now=0.5, dt=1.0,
         )
         assert hc.state.current_short == 0.0
         assert hc.state.residual == 5.0
@@ -127,5 +127,32 @@ class TestHedgeState:
 
     def test_last_action_recorded(self):
         hc = HedgeController(HedgeConfig())
-        _, _, _ = hc.evaluate(10.0, 10.0, 1500.0)
+        _, _, _ = hc.evaluate(10.0, 10.0, 1500.0, 150.0)
         assert hc.state.last_action == "no_trade"
+
+
+class TestUnits:
+    """Bands are base units: $1000 book at $150 -> ~0.39 SOL band, 0.13 SOL cap."""
+
+    def test_deadband_in_base_units(self):
+        hc = HedgeController(HedgeConfig())
+        assert abs(hc.compute_deadband_base(1000.0, 150.0) - 0.0585 * 1000 / 150) < 1e-3
+
+    def test_hedged_book_does_not_retrade(self):
+        hc = HedgeController(HedgeConfig(delta_cap_bps=1000.0))
+        for _ in range(10):
+            action, _, _ = hc.evaluate(3.0, 3.0, 1000.0, 150.0)
+            assert action == "no_trade"
+
+    def test_force_hedge_closes_residual_then_stops(self):
+        hc = HedgeController(HedgeConfig(delta_cap_bps=200.0))
+        hc.evaluate(3.0, 3.0, 1000.0, 150.0)
+        action, target, _ = hc.evaluate(4.0, 3.0, 1000.0, 150.0)
+        assert action == "force_hedge" and target == 4.0
+        action, _, _ = hc.evaluate(4.0, target, 1000.0, 150.0)
+        assert action == "no_trade"
+
+    def test_flat_inventory_with_short_still_has_cap(self):
+        hc = HedgeController(HedgeConfig(delta_cap_bps=200.0))
+        hc.evaluate(0.0, 0.0, 1000.0, 150.0)
+        assert hc.state.hard_cap > 0

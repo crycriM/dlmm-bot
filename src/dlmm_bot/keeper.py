@@ -388,6 +388,9 @@ class Keeper:
         self._extra_position_ids: list[str] = list(cfg.extra_position_ids)
         self._inventory_base: float = 0.0
         self._inventory_quote: float = 0.0  # in quote tokens
+        # ponytail: last hedge target sent, assumed filled; swap for an OPMS
+        # position read if the keeper ever gets one (it has no OPMS client).
+        self._hedge_short: float = 0.0
         self._halted = False
         self._cycle_count = 0
         self._decision_log: list[CycleRecord] = []
@@ -716,12 +719,14 @@ class Keeper:
             if self.hedge and self.cfg.pair_type == PairType.EXOTIC:
                 hedge_action, hedge_target, hedge_intent = self.hedge.evaluate(
                     inventory_base=self._inventory_base,
-                    current_short=0.0,  # read from OPMS in production
+                    current_short=self._hedge_short,
                     inventory_value_usd=total_inv_base * mid,
+                    price=mid,
                     sigma_now=regime.vol,
                     dt=self.cfg.refresh_interval,
                 )
                 if hedge_intent:
+                    self._hedge_short = hedge_target
                     subject = f"ctrl.{self.cfg.hedge_config.venue}.{self.cfg.hedge_config.coin}"
                     self.emit("hedge_intent", subject=subject, **asdict(hedge_intent))
                     self.publish(subject, asdict(hedge_intent))

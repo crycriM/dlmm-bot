@@ -37,7 +37,7 @@ class HedgeConfig:
     sigma_ref: float = 0.5           # reference annualized vol
     deadband_base_bps: float = 10.0  # base deadband in bps
     per_trade_cost_bps: float = 2.0  # cost per hedge trade
-    delta_cap_bps: float = 200.0     # hard cap on residual delta
+    delta_cap_bps: float = 1200.0    # hard cap on residual delta; keep above the cube-root band (~585bps at 2bps cost)
     cube_root_constant: float = 1.0  # calibration constant for band
     deadband_base: float = 0.0      # base deadband in base units
     venue: str = "hl"
@@ -68,28 +68,14 @@ class HedgeController:
             tau_h_eff=cfg.tau_h,
         )
 
-    def compute_deadband(self, price: float) -> float:
-        """Zakamouline/Whalley-Wilmott cube-root band.
-
-        bandwidth = cube_root_constant * (per_trade_cost)^(1/3) * price / 1e4
-
-        The cube-root insensitivity means 2->4bps widens the band only
-        ~26% (2^(1/3) = 1.26), so continuous hedging is never optimal.
-        """
-        cost_fraction = self.cfg.per_trade_cost_bps / 1e4
-        band_bps = self.cfg.cube_root_constant * (cost_fraction ** (1/3)) * 1e4
-        return self.cfg.deadband_base + band_bps * price / 1e4 * 0  # simplified: deadband in base units below
-
-    def compute_deadband_base(self, inventory_value_usd: float) -> float:
-        """Deadband in base units from cube-root rule.
+    def compute_deadband_base(self, inventory_value_usd: float, price: float) -> float:
+        """Deadband in base units from the cube-root rule.
 
         bandwidth_usd = constant * (cost)^(1/3) * inventory_value
-        Returns the band in base units (inventory terms).
         """
         cost_fraction = self.cfg.per_trade_cost_bps / 1e4
         band_usd = self.cfg.cube_root_constant * (cost_fraction ** (1/3)) * inventory_value_usd
-        # Convert to base via price — caller passes inventory_value_usd
-        return band_usd
+        return self.cfg.deadband_base + band_usd / price
 
     def vol_scale_window(self, sigma_now: float) -> float:
         """Contract tau_h when vol spikes; expand when calm.
@@ -118,28 +104,34 @@ class HedgeController:
         inventory_base: float,
         current_short: float,
         inventory_value_usd: float,
+        price: float,
         sigma_now: float = 0.0,
         dt: float = 1.0,
     ) -> tuple[str, float, ExecIntent | None]:
         """Evaluate hedge state and return (action, target_short, intent).
 
         action: "no_trade" | "rehedge" | "force_hedge"
+        current_short: current perp short size, positive = short (base units)
+        price: base price in USD, converts the USD bands to base units
         target_short: the desired short size (if action != no_trade)
         intent: ExecIntent to send to OPMS (None if no action)
         """
-        if not self.cfg.enabled:
+        if not self.cfg.enabled or price <= 0:
             return "no_trade", current_short, None
 
+        if self.state.last_action == "init":
+            self.state.ma_target = inventory_base  # seed: don't unwind an existing hedge
         self.update_ema(inventory_base, dt, sigma_now)
         self.state.current_short = current_short
         self.state.residual = inventory_base - current_short
-        self.state.deadband = self.compute_deadband_base(inventory_value_usd)
-        self.state.hard_cap = self.cfg.delta_cap_bps * inventory_value_usd / 1e4 / (inventory_value_usd / max(inventory_base, 1e-12)) if inventory_base != 0 else 0.0
+        self.state.deadband = self.compute_deadband_base(inventory_value_usd, price)
+        self.state.hard_cap = self.cfg.delta_cap_bps / 1e4 * inventory_value_usd / price
 
         # Hard delta-cap backstop: force hedge regardless
         if abs(self.state.residual) > self.state.hard_cap:
             action = "force_hedge"
-            target = self.state.ma_target  # close the gap to MA target
+            target = inventory_base  # close the residual; MA target never gets under the cap
+            self.state.ma_target = target  # re-anchor, else the band rehedges straight back
         elif abs(self.state.ma_target - current_short) > self.state.deadband:
             action = "rehedge"
             target = self.state.ma_target

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -42,35 +43,48 @@ def load_events(
     path: str, base_decimals: int, quote_decimals: int, pool: str | None = None
 ) -> list[BinEvent]:
     """Swap-stream rows → BinEvents, sized in quote units from the raw fields."""
-    events: list[BinEvent] = []
     with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            if pool and row.get("pool") != pool:
-                continue
-            prev = int(row["prev_active_bin"])
-            new = int(row["new_active_bin"])
-            # Direction from the bins themselves; the row's own field ties
-            # no-move swaps to "down" arbitrarily.
-            direction = "up" if new > prev else "down"
-            # An up-swap pays quote in, a down-swap takes quote out. Either
-            # way the quote leg is the trade's notional.
-            quote_raw = int(
-                row["amount_in_raw"] if direction == "up" else row["amount_out_raw"]
-            )
-            events.append(BinEvent(
-                ts=float(row.get("block_time") or row["ts"]),
-                pool=row.get("pool", ""),
-                active_bin=new,
-                prev_active_bin=prev,
-                direction=direction,
-                trade_size_usd=quote_raw / 10 ** quote_decimals,
-                fee_bps=float(row.get("fee_bps") or 0.0),
-                tvl_usd=row.get("tvl_usd"),
-            ))
+        rows = [json.loads(line) for line in fh if line.strip()]
+    rows = [r for r in rows if not pool or r.get("pool") == pool]
+
+    def price(quote_raw: int, base_raw: int) -> float:
+        return (quote_raw / 10 ** quote_decimals) / max(base_raw / 10 ** base_decimals, 1e-30)
+
+    # A bin move says which token was paid: up pays quote in, down takes it
+    # out. A no-move row's own `direction` is a default ("down" whatever was
+    # paid), so there the quote leg is the assignment whose implied price
+    # matches the crossing rows'.
+    # ponytail: ambiguous only if both assignments imply the same price.
+    crossing = sorted(
+        price(int(r["amount_in_raw"]), int(r["amount_out_raw"]))
+        if int(r["new_active_bin"]) > int(r["prev_active_bin"])
+        else price(int(r["amount_out_raw"]), int(r["amount_in_raw"]))
+        for r in rows if r["new_active_bin"] != r["prev_active_bin"]
+    )
+    ref = crossing[len(crossing) // 2] if crossing else None
+
+    events: list[BinEvent] = []
+    for row in rows:
+        prev = int(row["prev_active_bin"])
+        new = int(row["new_active_bin"])
+        direction = "up" if new > prev else "down"
+        in_raw, out_raw = int(row["amount_in_raw"]), int(row["amount_out_raw"])
+        if new != prev or ref is None or not (in_raw and out_raw):
+            quote_in = direction == "up"
+        else:
+            quote_in = (abs(math.log(price(in_raw, out_raw) / ref))
+                        < abs(math.log(price(out_raw, in_raw) / ref)))
+        quote_raw = in_raw if quote_in else out_raw
+        events.append(BinEvent(
+            ts=float(row.get("block_time") or row["ts"]),
+            pool=row.get("pool", ""),
+            active_bin=new,
+            prev_active_bin=prev,
+            direction=direction,
+            trade_size_usd=quote_raw / 10 ** quote_decimals,
+            fee_bps=float(row.get("fee_bps") or 0.0),
+            tvl_usd=row.get("tvl_usd"),
+        ))
     events.sort(key=lambda e: e.ts)
     return events
 
