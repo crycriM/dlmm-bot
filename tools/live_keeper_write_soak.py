@@ -69,6 +69,7 @@ from dlmm_bot.grid import VenueGrid
 from dlmm_bot.keeper import Keeper, KeeperConfig
 from dlmm_bot.oracle import OracleBars
 from dlmm_bot.risk_dlmm import PairType
+from dlmm_bot.swap_observer import JsonlSwapEventSource, SwapStreamRunner
 
 sys.path.insert(0, os.path.dirname(__file__))
 from live_keeper_soak import SECRET_ENV, close_bridge  # noqa: E402
@@ -210,7 +211,8 @@ def build_keeper(args: argparse.Namespace, bridge: ExecBridge, run_dir: Path) ->
     return Keeper(cfg=cfg, exec_bridge=bridge, oracle=_oracle_from_args(args))
 
 
-async def run_soak(keeper: Keeper, duration: float, stop_event: asyncio.Event) -> str:
+async def run_soak(keeper: Keeper, duration: float, stop_event: asyncio.Event,
+                   swap_stream_path: Path | None = None) -> str:
     """Cycle until `duration` elapses or `stop_event` fires (SIGTERM/SIGINT),
     then withdraw everything this run opened — while the event log is still
     open — and only then finalize it.
@@ -219,10 +221,21 @@ async def run_soak(keeper: Keeper, duration: float, stop_event: asyncio.Event) -
     exits, which would silently drop the clean-stop withdrawal from the
     audit trail; driving cycles here instead keeps withdrawal-before-close
     order under our control.
+
+    The keeper does not tail the executor's swap stream by itself; the runner
+    here feeds it so the log carries observed_trade/bin_fill for fill-level
+    PnL. It keeps running through the clean-stop withdrawal and is stopped
+    only just before the log closes.
     """
     deadline = time.monotonic() + duration
     stop_reason = "duration_elapsed"
     keeper._running = True
+    keeper._ensure_run_started()
+    swap_task = None
+    if swap_stream_path is not None and keeper.swap_observer is not None:
+        swap_task = SwapStreamRunner(
+            keeper.swap_observer, JsonlSwapEventSource(str(swap_stream_path)),
+        ).start()
     try:
         while time.monotonic() < deadline and not stop_event.is_set():
             try:
@@ -245,6 +258,9 @@ async def run_soak(keeper: Keeper, duration: float, stop_event: asyncio.Event) -
             except Exception:
                 logger.exception("Clean-stop withdrawal failed — reconcile manually "
                                  "via verify_log.py before treating the wallet as drained")
+        if swap_task is not None:
+            swap_task.cancel()
+            await asyncio.gather(swap_task, return_exceptions=True)
         keeper.stop()
     return stop_reason
 
@@ -288,7 +304,9 @@ def main(argv=None) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop_event.set)
     try:
-        stop_reason = loop.run_until_complete(run_soak(keeper, args.duration_seconds, stop_event))
+        stop_reason = loop.run_until_complete(run_soak(
+            keeper, args.duration_seconds, stop_event, run_dir / "swaps.jsonl",
+        ))
     finally:
         loop.close()
         close_bridge(bridge)

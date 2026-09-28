@@ -1,8 +1,17 @@
 """Ladder placement driven by Avellaneda–Stoikov reservation price.
 
 The active bin is shifted by the AS inventory-tilt to produce a new
-ladder center.  Inner levels start at `inner_offset` bins from center,
-and per-level sizes are scaled by skew derived from inventory error.
+ladder center.  Each side is one contiguous block of `levels` bins whose
+innermost bin sits `inner_offset` bins from center, and per-level sizes are
+scaled by skew derived from inventory error.
+
+Contiguous, not spaced every `inner` bins: the executor deposits each side
+with Meteora's native one-sided instruction over a single contiguous range
+and rejects gaps (2026-09-28: a spaced γ=30/κ=20 ladder failed live with
+`bin_ids must be contiguous`). For inner = 1 both shapes are identical.
+Neither side may reach across the active bin — bids stay below it, asks at
+or above it — so a tilt larger than the offset slides that side's block to
+the active-bin edge instead of placing liquidity the pool cannot hold.
 
 AS mapping:
     center = active_bin + round((r - S) / bin_width_in_bins)
@@ -65,15 +74,17 @@ def build_ladder(
     ask_frac = 0.5 * (1.0 + skew)
     bid_frac = 1.0 - ask_frac
 
+    # Innermost bins, slid back to the active-bin edge when the tilt crosses it.
+    top_bid = min(center - inner, active_bin - 1)
+    low_ask = max(center + inner, active_bin)
+
     levels: list[LadderLevel] = []
-    for i in range(1, cfg.levels + 1):
+    for i in range(cfg.levels):
         weight = cfg.level_weight
-        # Bid side: center - i * inner
-        bid_bin = center - i * inner
+        bid_bin = top_bid - i
         bid_size = cfg.capital * bid_frac * weight
         levels.append(LadderLevel(bin_id=bid_bin, side="bid", size=bid_size))
-        # Ask side: center + i * inner
-        ask_bin = center + i * inner
+        ask_bin = low_ask + i
         ask_size = cfg.capital * ask_frac * weight / grid.price_from_bin(ask_bin)
         levels.append(LadderLevel(bin_id=ask_bin, side="ask", size=ask_size))
 

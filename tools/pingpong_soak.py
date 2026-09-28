@@ -132,8 +132,8 @@ def simulate(
 
         cell = bins.get(e.active_bin)
         if pool_bin_quote and e.active_bin == e.prev_active_bin and cell:
-            # ponytail: fixed pool depth, and the in-bin swap's effect on the
-            # active bin's token mix is ignored (it mostly reverts in-bin).
+            # ponytail: the in-bin swap's effect on the active bin's token mix
+            # is ignored (it mostly reverts in-bin).
             ours = cell[0] * mid + cell[1]
             depth = pool_bin_quote(e) if callable(pool_bin_quote) else pool_bin_quote
             fee = e.trade_size_usd * e.fee_bps / 1e4 * ours / (depth + ours)

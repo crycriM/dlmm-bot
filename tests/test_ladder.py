@@ -26,14 +26,15 @@ class TestCenterShift:
         assert mid == 100.0
 
     def test_positive_tilt_shifts_center_up(self, grid):
-        """r > S tilts center higher (long inventory → lower quotes)."""
+        """r > S tilts center higher: asks move up, and bids rise to the
+        active-bin edge but never across it."""
         levels = build_ladder(grid, active_bin=100, r=151.0, S=150.0, half_spread=0.01, skew=0.0)
-        bids = [l for l in levels if l.side == "bid"]
-        mid = (bids[0].bin_id + bids[0].bin_id) / 2  # not needed, check bids moved
-        # All bids should be at higher bin ids than no-tilt case
         levels_no_tilt = build_ladder(grid, active_bin=100, r=150.0, S=150.0, half_spread=0.01, skew=0.0)
-        bids_no_tilt = [l for l in levels_no_tilt if l.side == "bid"]
-        assert all(b.bin_id > bnt.bin_id for b, bnt in zip(bids, bids_no_tilt))
+        asks = [l for l in levels if l.side == "ask"]
+        asks_no_tilt = [l for l in levels_no_tilt if l.side == "ask"]
+        assert all(a.bin_id > ant.bin_id for a, ant in zip(asks, asks_no_tilt))
+        bids = [l for l in levels if l.side == "bid"]
+        assert max(b.bin_id for b in bids) == 99
 
     def test_negative_tilt_shifts_center_down(self, grid):
         """r < S tilts center lower."""
@@ -51,10 +52,12 @@ class TestCenterShiftMagnitude:
     """
 
     def test_one_dollar_tilt_on_150(self, grid):
-        """r=151 on S=150 with 2 bps bins ≈ log(151/150)/log(1.0002) ≈ 33 bins."""
+        """r=151 on S=150 with 2 bps bins ≈ log(151/150)/log(1.0002) ≈ 33 bins.
+        Measured on the ask side: an upward tilt cannot move bids past the
+        active bin."""
         levels = build_ladder(grid, active_bin=100, r=151.0, S=150.0, half_spread=0.01, skew=0.0)
         levels_no_tilt = build_ladder(grid, active_bin=100, r=150.0, S=150.0, half_spread=0.01, skew=0.0)
-        shift = levels[0].bin_id - levels_no_tilt[0].bin_id
+        shift = levels[-1].bin_id - levels_no_tilt[-1].bin_id
         assert shift == 33
 
     def test_shift_independent_of_price_level(self):
@@ -68,7 +71,7 @@ class TestCenterShiftMagnitude:
                                   half_spread=price * 0.0001, skew=0.0)
             flat = build_ladder(g, active_bin=0, r=price, S=price,
                                 half_spread=price * 0.0001, skew=0.0)
-            return tilted[0].bin_id - flat[0].bin_id
+            return tilted[-1].bin_id - flat[-1].bin_id  # asks: free to move up
 
         assert shift_for(1.0) == shift_for(150.0) == shift_for(50000.0)
         # 1% tilt at 20 bps bins ≈ log(1.01)/log(1.002) ≈ 5 bins
@@ -189,3 +192,26 @@ class TestLadderStructure:
         asks = [l for l in levels if l.side == "ask"]
         for b, a in zip(bids, asks):
             assert b.bin_id < a.bin_id
+
+
+class TestExecutorShape:
+    """What the executor's native one-sided deposit accepts (deposit.ts)."""
+
+    @pytest.mark.parametrize("half_spread", [0.001, 0.05, 0.5])
+    @pytest.mark.parametrize("r", [140.0, 150.0, 160.0])
+    def test_each_side_contiguous_and_never_crosses_active(self, grid, half_spread, r):
+        levels = build_ladder(grid, active_bin=100, r=r, S=150.0,
+                              half_spread=half_spread, skew=0.0)
+        for side in ("bid", "ask"):
+            bins = sorted(l.bin_id for l in levels if l.side == side)
+            assert bins == list(range(bins[0], bins[0] + len(bins))), side
+        assert max(l.bin_id for l in levels if l.side == "bid") <= 99
+        assert min(l.bin_id for l in levels if l.side == "ask") >= 100
+
+    def test_wide_offset_is_one_block_not_spaced(self):
+        """A 9-bin inner offset (live γ=30/κ=20 failure) gives one block."""
+        g = VenueGrid(ref_price=150.0, bin_step_bps=4, base_decimals=9, quote_decimals=6)
+        hs = 150.0 * ((1.0004 ** 9) - 1)
+        asks = sorted(l.bin_id for l in build_ladder(g, active_bin=0, r=150.0, S=150.0,
+                                                    half_spread=hs, skew=0.0) if l.side == "ask")
+        assert asks == [9, 10, 11, 12, 13]
