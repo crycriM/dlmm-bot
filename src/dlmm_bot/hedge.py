@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable
 
 from mm_core.contracts import ExecIntent
 
@@ -116,7 +116,11 @@ class HedgeController:
         target_short: the desired short size (if action != no_trade)
         intent: ExecIntent to send to OPMS (None if no action)
         """
-        if not self.cfg.enabled or price <= 0:
+        if (
+            not self.cfg.enabled
+            or not all(math.isfinite(x) for x in (inventory_base, current_short, inventory_value_usd, sigma_now, dt))
+            or not (math.isfinite(price) and price > 0)
+        ):
             return "no_trade", current_short, None
 
         if self.state.last_action == "init":

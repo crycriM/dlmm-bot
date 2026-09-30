@@ -25,9 +25,9 @@ import os
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
-from typing import Callable, Optional
+from typing import Callable
 
-from mm_core.contracts import MarketSnapshot, ExecIntent, QuoteSpec
+from mm_core.contracts import ExecIntent
 from mm_core.inventory import TwoTokenInventory, Caps
 from mm_core.markout import MarkoutTracker
 from mm_core.pnl import Fill, PnLLedger
@@ -48,8 +48,10 @@ from dlmm_bot.oracle import OracleBars
 
 logger = logging.getLogger(__name__)
 
-DRIFT_THRESHOLD_BINS = 3
 REFRESH_GAS_LAMPORTS = 50000  # ~0.00005 SOL per refresh
+# Consecutive failed signing actions before the keeper halts: a rejected/failing write is
+# retried every cycle (5 s), each attempt possibly costing fees, so it must be bounded.
+MAX_ACTION_FAILURES = 5
 
 
 @dataclass
@@ -254,6 +256,8 @@ def plan_cycle(
     `regime_history` (oracle bar closes, see `dlmm_bot.oracle`) replaces the
     pool's own poll samples for the regime gate and σ when the pool ticks
     too rarely to estimate them; the ladder still centres on the pool price."""
+    if not (math.isfinite(mid) and mid > 0):  # Caps below divide by mid
+        return CyclePlan(Decision.HOLD, "passive", reason="invalid_mid")
     signal_history = regime_history if regime_history is not None else price_history
     kill, kill_reason = dlmm_risk.evaluate_tvl(ts, tvl_usd)
     if kill:
@@ -391,7 +395,8 @@ class Keeper:
         # ponytail: last hedge target sent, assumed filled; swap for an OPMS
         # position read if the keeper ever gets one (it has no OPMS client).
         self._hedge_short: float = 0.0
-        self._halted = False
+        self._halted = False  # emergency exit / repeated failures: never act again in this process
+        self._action_failures = 0
         self._cycle_count = 0
         self._decision_log: list[CycleRecord] = []
 
@@ -400,7 +405,6 @@ class Keeper:
         self._run_id: str = self.log.run_id if self.log is not None else ""
         self._req_counter = 0
         self._last_mid: float | None = None
-        self._last_mid_ts: float | None = None
         self._prev_active_bin: int | None = None
         self._last_regime = None
         self._run_started_emitted = bool(
@@ -508,6 +512,9 @@ class Keeper:
                 except Exception as e:
                     logger.exception("Keeper cycle error: %s", e)
                 self._cycle_count += 1
+                if self._halted:
+                    logger.critical("Keeper HALTED; leaving the run loop. Reconcile positions before restarting.")
+                    break
                 if max_cycles and self._cycle_count >= max_cycles:
                     break
                 await asyncio.sleep(self.cfg.refresh_interval)
@@ -530,6 +537,8 @@ class Keeper:
         ts = time.time()
         if self.log is not None:
             self.log.set_cycle(self._cycle_count)
+        if self._halted:
+            return self._finish_cycle(self._make_record(ts, Decision.HOLD, "passive", "halted"))
 
         # 0. Sentinel kill-switch (written by tvl_monitor.py) — now loggable
         if self.cfg.sentinel_path:
@@ -565,12 +574,31 @@ class Keeper:
             )
 
         state = state_result.data
-        self._active_bin = state.get("active_bin", state.get("activeBin", 0))
-        balances = state.get("balances", state.get("balances", {}))
-        self._inventory_base = float(balances.get("base", 0.0))
-        self._inventory_quote = float(balances.get("quote", 0.0))
-
-        mid = self.cfg.grid.price_from_bin(self._active_bin)
+        active_bin = state.get("active_bin", state.get("activeBin"))
+        balances = state.get("balances") or {}
+        try:
+            base, quote = float(balances.get("base", 0.0)), float(balances.get("quote", 0.0))
+            mid = self.cfg.grid.price_from_bin(active_bin)
+            valid = (
+                isinstance(active_bin, (int, float)) and not isinstance(active_bin, bool)
+                and math.isfinite(active_bin) and active_bin == int(active_bin)
+                and math.isfinite(base) and math.isfinite(quote) and base >= 0 and quote >= 0
+                and math.isfinite(mid) and mid > 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            # Same posture as a failed read: record and hold, never trade on a guessed price.
+            logger.error("Malformed executor state (active_bin=%r balances=%r); holding", active_bin, balances)
+            self.emit(
+                "state_observation", ts=ts, state=_jsonable(state), ok=False,
+                error="malformed_state", mid=None,
+            )
+            return self._finish_cycle(
+                self._make_record(ts, Decision.STOP_QUOTING, "error", "bad_state")
+            )
+        self._active_bin = int(active_bin)
+        self._inventory_base, self._inventory_quote = base, quote
         self._price_history.append(mid)
         self._ts_history.append(ts)
         self.pnl.mark(ts, mid)
@@ -620,7 +648,7 @@ class Keeper:
                 claimable_fee_y_raw=pos_data.get("claimable_fee_y_raw"),
             )
 
-        self._last_mid, self._last_mid_ts = mid, ts
+        self._last_mid = mid
         if self.swap_observer is not None:
             self.swap_observer.set_last_mid(mid, ts)
         self.emit("pnl_mark", ts=ts, mid=mid)
@@ -717,7 +745,7 @@ class Keeper:
 
             # Hedge evaluation for exotic pairs
             if self.hedge and self.cfg.pair_type == PairType.EXOTIC:
-                hedge_action, hedge_target, hedge_intent = self.hedge.evaluate(
+                _, hedge_target, hedge_intent = self.hedge.evaluate(
                     inventory_base=self._inventory_base,
                     current_short=self._hedge_short,
                     inventory_value_usd=total_inv_base * mid,
@@ -734,7 +762,7 @@ class Keeper:
             record = self._make_record(
                 ts, decision, urgency, action, mid=mid,
                 r=r, half_spread=half_spread,
-                center_bin=center_bin if 'center_bin' in dir() else self._active_bin,
+                center_bin=center_bin,
                 refresh_reason=refresh_reason,
                 refresh_needed=refresh_needed,
                 net_delta=plan.net_delta,
@@ -777,6 +805,22 @@ class Keeper:
         self._current_position_id = ids[0]
         self._extra_position_ids = list(ids[1:])
 
+    def _unwind_hedge(self, why: str) -> None:
+        """Base has been swapped out, so an open perp short would now be a naked short."""
+        if self.hedge is None or self._hedge_short == 0.0:
+            return
+        hedge_cfg = self.cfg.hedge_config
+        intent = ExecIntent(
+            venue=hedge_cfg.venue, coin=hedge_cfg.coin, target_inventory=0.0,
+            current_inventory=-self._hedge_short, urgency="immediate",
+            strategy_hint="passive_aggressive",
+        )
+        logger.critical("Unwinding hedge (%s): closing short %.6g %s", why, self._hedge_short, hedge_cfg.coin)
+        self._hedge_short = 0.0
+        subject = f"ctrl.{hedge_cfg.venue}.{hedge_cfg.coin}"
+        self.emit("hedge_intent", subject=subject, **asdict(intent))
+        self.publish(subject, asdict(intent))
+
     async def _withdraw_extra_positions(self, tag: str) -> bool:
         """Close ask-side PDAs opened by two-sided ladders. Keeps any id that
         failed to withdraw so it is never silently dropped."""
@@ -811,6 +855,19 @@ class Keeper:
         self, req_id: str, verb: str, result: ExecResult, gas_label: str
     ) -> None:
         """Correlate request→result and persist every transaction receipt."""
+        if result.ok:
+            self._action_failures = 0
+        else:
+            self._action_failures += 1
+            if result.unknown_outcome:
+                # The action may have landed untracked (e.g. a second deposit PDA). Retrying
+                # blindly could double-deploy capital: stop and let an operator reconcile.
+                logger.critical("%s outcome UNKNOWN (%s); halting", verb, result.error)
+                self._halted = True
+            elif self._action_failures >= MAX_ACTION_FAILURES:
+                logger.critical("%d consecutive failed actions (last: %s %s); halting",
+                                self._action_failures, verb, result.error)
+                self._halted = True
         self.emit(
             "action_result",
             req_id=req_id,
@@ -944,8 +1001,8 @@ class Keeper:
             else:
                 logger.error("Bid deposit failed: %s", result.error)
 
-        # Deposit ask side (base token above mid)
-        if asks:
+        # Deposit ask side (base token above mid); not after the bid leg halted the keeper
+        if asks and not self._halted:
             req_id = self._next_req_id()
             payload = {
                 "pool": self.cfg.pool_address,
@@ -1132,6 +1189,7 @@ class Keeper:
             self._emit_result(req_id, "swap", result, "de_risk_swap")
             if result.ok:
                 logger.info("De-risk swap executed: %s", result.tx_signatures)
+                self._unwind_hedge("de_risk")
             else:
                 logger.error("De-risk swap failed: %s", result.error)
 
@@ -1182,6 +1240,8 @@ class Keeper:
                 logger.critical("Emergency swap ok: %s", result.tx_signatures)
             else:
                 logger.critical("Emergency swap FAILED: %s", result.error)
+        # Halted: nothing will manage the hedge any more, so close it whatever the swap did.
+        self._unwind_hedge("emergency_exit")
         self._halted = True
 
     def _make_record(
@@ -1231,10 +1291,16 @@ class Keeper:
     ) -> None:
         """Log the decision record to the in-memory list + emit a `decision`
         event to the event log (the shadow-mode / rerun artifact)."""
+        changed = not self._decision_log or self._decision_log[-1].decision != record.decision
         self._decision_log.append(record)
-        logger.info(
-            "cycle %d: decision=%s action=%s mid=%.4f active_bin=%d",
+        logger.log(
+            logging.INFO if changed or record.action not in ("none", "hold") else logging.DEBUG,
+            "cycle %d: decision=%s action=%s mid=%.4f active_bin=%d inv=%.6g/%.6g "
+            "reason=[%s|%s] regime=%s%s",
             self._cycle_count, record.decision, record.action, record.mid, record.active_bin,
+            record.inventory_base, record.inventory_quote,
+            self.risk_policy.last_reason, record.refresh_reason, record.regime_state,
+            " (changed)" if changed else "",
         )
         self.emit(
             "decision",

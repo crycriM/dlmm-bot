@@ -46,12 +46,17 @@ def simulate(
     capital: float = 1000.0, gas_cost: float = GAS_COST, band_pct: float = 5.0,
     perp_cost_bps: float = 5.0, funding_apr: float = 0.0,
     pool_bin_quote: float | Callable[[BinEvent], float] = 0.0,
+    in_bin_haircut: float = 1.0,
 ) -> dict:
     """One run: the LP leg alone, the perp hedge, and their sum.
 
     A non-zero `pool_bin_quote` (a constant, or per event from `depth_at`)
     credits swaps that stay inside the active bin: the pool fee times our
     share of that bin, ours / (pool depth + ours).
+
+    `in_bin_haircut` scales only that in-bin credit. The pro-rata share has
+    no queue priority, no time in book and no self-trade effect, so it is an
+    upper bound; a haircut re-checks the gate under a lower fill assumption.
     """
     lp, perp = PnLLedger("meteora", "pingpong"), PnLLedger("hl", "hedge")
     first = events[0]
@@ -136,7 +141,8 @@ def simulate(
             # is ignored (it mostly reverts in-bin).
             ours = cell[0] * mid + cell[1]
             depth = pool_bin_quote(e) if callable(pool_bin_quote) else pool_bin_quote
-            fee = e.trade_size_usd * e.fee_bps / 1e4 * ours / (depth + ours)
+            fee = (e.trade_size_usd * e.fee_bps / 1e4 * ours / (depth + ours)
+                   * in_bin_haircut)
             fees += fee
             in_bin_fees += fee
             lp.on_cash_flow("lp_fee", e.ts, fee, label="in_bin_fee")
@@ -289,6 +295,11 @@ def main(argv: list[str] | None = None) -> int:
                            help="pool liquidity per bin near the active bin, quote units; "
                                 "default: estimated from multi-bin swaps; 0 = no in-bin fees")
     ap.add_argument("--split", type=float, default=0.5, help="also run each half; 0 = off")
+    ap.add_argument("--window-hours", type=float, default=0.0,
+                    help="keep only the last N hours of the capture; 0 = whole capture")
+    ap.add_argument("--in-bin-haircut", type=float, default=1.0,
+                    help="fraction of the modeled in-bin fee credit to book (0-1); "
+                         "the pro-rata share is an upper bound, so re-gate below 1")
     ap.add_argument("--json", default=None, help="write every cell here")
     args = ap.parse_args(argv)
 
@@ -296,6 +307,12 @@ def main(argv: list[str] | None = None) -> int:
     if not events:
         print(f"no events in {args.swaps}", file=sys.stderr)
         return 1
+    if args.window_hours:
+        cutoff = events[-1].ts - args.window_hours * 3600
+        events = [e for e in events if e.ts >= cutoff]
+        if not events:
+            print(f"window of {args.window_hours:g} h leaves no events", file=sys.stderr)
+            return 1
     grid = VenueGrid(
         ref_price=10 ** (args.base_decimals - args.quote_decimals),
         bin_step_bps=args.bin_step,
@@ -322,11 +339,12 @@ def main(argv: list[str] | None = None) -> int:
         args.split,
         capital=args.capital, gas_cost=gas_cost, band_pct=args.band_pct,
         perp_cost_bps=args.perp_cost_bps, funding_apr=args.funding_apr,
-        pool_bin_quote=pool_bin_quote,
+        pool_bin_quote=pool_bin_quote, in_bin_haircut=args.in_bin_haircut,
     )
     span_h = (events[-1].ts - events[0].ts) / 3600
     print(f"{len(events)} swaps over {span_h:.1f} h, gas {gas_cost:.5f}/action, "
           f"perp {args.perp_cost_bps:g} bps, funding {args.funding_apr:g} APR, "
+          f"in-bin haircut {args.in_bin_haircut:g}, "
           f"pool depth {'sampled: ' + args.depth if args.depth else f'{pool_bin_quote:,.0f}/bin'}")
     for r in rows:
         print(_fmt(r))

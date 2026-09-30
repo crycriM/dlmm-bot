@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import subprocess
+import threading
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,8 @@ class ExecResult:
     fee_lamports: int | None = None
     compute_unit_price: int | None = None
     position_id: str | None = None
+    # Timeout/EOF: the request may or may not have landed on chain. Never retry blindly.
+    unknown_outcome: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -128,15 +132,18 @@ class ExecResult:
 class ExecBridge:
     """Talks to the TS executor subprocess via JSON-lines."""
 
-    def __init__(self, cmd: list[str], cwd: str | None = None, timeout: float = 60.0):
+    def __init__(self, cmd: list[str], cwd: str | None = None, timeout: float = 120.0):
         """
         cmd: e.g. ['node', 'executor/bridge.js']
         cwd: directory where the TS executor lives
+        timeout: per-request cap in seconds. Must exceed the executor's own 60 s
+            bundle deadline, or a slow-but-fine confirmation gets killed mid-flight.
         """
         self.cmd = cmd
         self.cwd = cwd
         self.timeout = timeout
         self._proc: subprocess.Popen | None = None
+        self._stderr_tail: deque[str] = deque(maxlen=50)
 
     def start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -150,7 +157,20 @@ class ExecBridge:
             text=True,
             bufsize=1,
         )
+        # The executor logs everything to stderr. If nobody reads it the OS pipe (64 KiB)
+        # fills, node blocks on write and the keeper blocks on readline forever.
+        threading.Thread(
+            target=self._drain_stderr, args=(self._proc.stderr,), daemon=True,
+        ).start()
         logger.info("ExecBridge subprocess started: %s", self.cmd)
+
+    def _drain_stderr(self, stream) -> None:
+        try:
+            for line in stream:
+                self._stderr_tail.append(line.rstrip())
+                logger.debug("executor: %s", line.rstrip())
+        except (ValueError, OSError):  # stream closed by stop()
+            pass
 
     def stop(self) -> None:
         if self._proc is None:
@@ -167,17 +187,44 @@ class ExecBridge:
         self._proc = None
 
     def _send(self, request: dict) -> ExecResult:
-        """Send a JSON request and read the JSON response."""
+        """Send a JSON request and read the JSON response.
+
+        A failure here does NOT mean the action did not happen: on timeout or EOF a
+        signed transaction may already be on chain, so callers must reconcile from
+        chain state (get_state/get_position) before retrying a mutating verb.
+        """
+        try:
+            line = json.dumps(request, allow_nan=False) + "\n"  # NaN/inf must never reach the signer
+        except ValueError as e:
+            return ExecResult(ok=False, error=f"refusing to send non-finite value: {e}")
         if self._proc is None or self._proc.poll() is not None:
             self.start()
         assert self._proc is not None and self._proc.stdin is not None
-        line = json.dumps(request) + "\n"
-        self._proc.stdin.write(line)
-        self._proc.stdin.flush()
-        resp_line = self._proc.stdout.readline()
+        proc = self._proc
+        proc.stdin.write(line)
+        proc.stdin.flush()
+        # Killing the process unblocks readline (EOF) and guarantees a late reply can
+        # never be misread as the answer to the NEXT request (there are no request ids).
+        timed_out = threading.Event()
+
+        def _kill() -> None:
+            timed_out.set()
+            proc.kill()
+
+        timer = threading.Timer(self.timeout, _kill)
+        timer.start()
+        try:
+            resp_line = proc.stdout.readline()
+        finally:
+            timer.cancel()
+        if timed_out.is_set():
+            logger.critical("executor timed out after %.0fs on %s; killed, outcome UNKNOWN",
+                            self.timeout, request.get("method"))
+            return ExecResult(ok=False, unknown_outcome=True,
+                              error=f"executor timeout after {self.timeout:.0f}s (killed; outcome unknown)")
         if not resp_line:
-            stderr = self._proc.stderr.read() if self._proc.stderr else ""
-            return ExecResult(ok=False, error=f"executor EOF: {stderr[:500]}")
+            tail = "\n".join(self._stderr_tail)
+            return ExecResult(ok=False, unknown_outcome=True, error=f"executor EOF: {tail[-500:]}")
         try:
             raw = json.loads(resp_line)
         except json.JSONDecodeError as e:
@@ -217,6 +264,10 @@ class ExecBridge:
         })
 
     def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
+        # Despite the name, the executor reads this as a PERCENT (100 = 100%); see
+        # solana-clmm-executor/src/withdraw.ts. Anything outside 1..100 is a caller bug.
+        if not isinstance(bps, int) or not 1 <= bps <= 100:
+            return ExecResult(ok=False, error=f"refusing withdraw: bps={bps!r} outside 1..100 (percent)")
         return self._send({
             "method": "withdraw",
             "position_id": position_id,
@@ -231,6 +282,10 @@ class ExecBridge:
         pool: str,
         max_slippage_bps: int = 50,
     ) -> ExecResult:
+        if not (isinstance(amount, (int, float)) and math.isfinite(amount) and amount > 0):
+            return ExecResult(ok=False, error=f"refusing swap: amount={amount!r} must be finite and > 0")
+        if not 0 < max_slippage_bps <= 1_000:
+            return ExecResult(ok=False, error=f"refusing swap: max_slippage_bps={max_slippage_bps!r} outside (0, 1000]")
         return self._send({
             "method": "swap",
             "in_mint": in_mint,
@@ -267,7 +322,6 @@ class FakeExecBridge:
         self._positions: dict[str, dict] = {}
         self._receipt: dict = {}
         self._next_ok = True
-        self._withdraw_side_effect = None
 
     def set_state(self, pool: str, active_bin: int, balances: dict | None = None, tvl_usd: float | None = None):
         self._state[pool] = {

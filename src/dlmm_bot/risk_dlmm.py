@@ -18,9 +18,9 @@ separate consumer runs.
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 from mm_core.risk_policy import Decision, RiskConfig
 
@@ -55,7 +55,7 @@ class DLMMRiskState:
     """State for DLMM-specific risk checks."""
     last_tvl: float | None = None
     last_tvl_ts: float | None = None
-    peak_equity: float = float("-inf")
+    tvl_window: deque = field(default_factory=deque)  # (ts, tvl) readings inside tvl_window_s
     kill_switch_fired: bool = False
     kill_reason: str = ""
 
@@ -81,7 +81,9 @@ class DLMMRiskPolicy:
 
         kill=True means the keeper should emergency_exit immediately.
         """
-        if tvl_usd is None:
+        if tvl_usd is None or not math.isfinite(tvl_usd):
+            # Unknown reading: NaN would compare False against every threshold (kill switch
+            # silently off) and poison the baseline, so ignore it entirely.
             return False, ""
 
         # Minimum TVL gate
@@ -90,19 +92,24 @@ class DLMMRiskPolicy:
             self.state.kill_reason = f"TVL below minimum: ${tvl_usd:.0f} < ${self.cfg.min_tvl_usd:.0f}"
             return True, self.state.kill_reason
 
-        # TVL drop detection
-        if self.state.last_tvl is not None and self.state.last_tvl_ts is not None:
-            elapsed = ts - self.state.last_tvl_ts
-            if elapsed > 0 and elapsed <= self.cfg.tvl_window_s:
-                drop_pct = (self.state.last_tvl - tvl_usd) / self.state.last_tvl * 100.0
-                if drop_pct > self.cfg.tvl_drop_pct:
-                    self.state.kill_switch_fired = True
-                    self.state.kill_reason = (
-                        f"TVL dropped {drop_pct:.1f}% in {elapsed:.0f}s: "
-                        f"${self.state.last_tvl:.0f} → ${tvl_usd:.0f}"
-                    )
-                    return True, self.state.kill_reason
+        # TVL drop detection against the PEAK of the lookback window, not just the previous
+        # poll: a drain spread over several polls (each step small) must still trip it.
+        window = self.state.tvl_window
+        while window and ts - window[0][0] > self.cfg.tvl_window_s:
+            window.popleft()
+        earlier = [(t, v) for t, v in window if t < ts]
+        if earlier:
+            peak_ts, peak = max(earlier, key=lambda row: row[1])
+            drop_pct = (peak - tvl_usd) / peak * 100.0 if peak > 0 else 0.0
+            if drop_pct > self.cfg.tvl_drop_pct:
+                self.state.kill_switch_fired = True
+                self.state.kill_reason = (
+                    f"TVL dropped {drop_pct:.1f}% in {ts - peak_ts:.0f}s: "
+                    f"${peak:.0f} → ${tvl_usd:.0f}"
+                )
+                return True, self.state.kill_reason
 
+        window.append((ts, tvl_usd))
         self.state.last_tvl = tvl_usd
         self.state.last_tvl_ts = ts
         return False, ""

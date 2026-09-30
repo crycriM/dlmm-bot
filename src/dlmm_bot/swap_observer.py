@@ -27,7 +27,7 @@ import asyncio
 import json
 import os
 import time
-from typing import AsyncIterable, Callable, Mapping, Optional, Protocol
+from typing import AsyncIterable, Callable, Mapping, Protocol
 
 from dlmm_bot.event_log import EventLog, _jsonable
 from dlmm_bot.grid import VenueGrid
@@ -44,15 +44,11 @@ class SwapObserver:
         self._position_id: str | None = None
         self._seen: set[str] = set()
         self._last_mid: float | None = None
-        self._last_mid_ts: float | None = None
         self._default_fee_bps: float = 25.0
         self._fill_callback: Callable[[float, str, float, float], None] | None = None
 
-    def set_default_fee_bps(self, fee_bps: float) -> None:
-        self._default_fee_bps = float(fee_bps)
-
     def set_last_mid(self, mid: float, ts: float) -> None:
-        self._last_mid, self._last_mid_ts = mid, ts
+        self._last_mid = mid
 
     def set_fill_callback(
         self, callback: Callable[[float, str, float, float], None]
@@ -220,24 +216,6 @@ class SwapObserver:
 
         return seq
 
-    async def feed_async_stream(self, stream: AsyncIterable[dict]) -> int:
-        """Drain a decoded live stream into the same total-ordered writer."""
-        n = 0
-        async for payload in stream:
-            if self.on_swap(payload) is not None:
-                n += 1
-        return n
-
-    def feed_stream(self, stream) -> int:
-        """Drain an iterable/async-iterable of decoded swap payloads.
-        Synchronous iterables only; for async, loop over the async
-        iterator yourself and call on_swap()."""
-        n = 0
-        for payload in stream:
-            if self.on_swap(payload) is not None:
-                n += 1
-        return n
-
 
 class SwapEventSource(Protocol):
     """Decoded swap source implemented by an executor, RPC decoder, or file tail."""
@@ -333,7 +311,15 @@ class SwapStreamRunner:
                     error=f"{type(exc).__name__}: {exc}",
                     after_signature=self._last_signature,
                 )
-                await self._backfill()
+                try:
+                    await self._backfill()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as backfill_exc:  # must not end the stream task
+                    self.observer.log.emit(
+                        "swap_stream_gap", error=f"backfill {type(backfill_exc).__name__}: {backfill_exc}",
+                        after_signature=self._last_signature,
+                    )
                 await asyncio.sleep(self.retry_delay)
 
     def start(self) -> asyncio.Task:

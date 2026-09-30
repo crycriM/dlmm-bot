@@ -24,7 +24,7 @@ import os
 import subprocess
 import threading
 import time
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator
 
 SCHEMA_VERSION = 2
 

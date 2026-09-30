@@ -27,7 +27,6 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field, asdict
-from typing import Optional
 
 from mm_core.pnl import Fill, PnLLedger
 from mm_core.markout import MarkoutTracker
