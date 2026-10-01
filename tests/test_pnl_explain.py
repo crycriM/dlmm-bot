@@ -111,7 +111,7 @@ class TestInventory:
 
     def test_withdraw_resets_inventory(self):
         evs = self._open_events() + [
-            _ev("position_withdrawn", 1.0, position_id="P", bps=100,
+            _ev("position_withdrawn", 1.0, position_id="P", percent=100,
                 tx_signatures=["T"]),
         ]
         r = explain_run(evs)

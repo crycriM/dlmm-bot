@@ -20,7 +20,9 @@ def test_executor_response_fixture(verb, outcome):
     assert result.ok is (outcome == "ok")
     assert result.error == payload["error"]
     assert result.data == payload["data"]
-    assert set(payload) <= {"ok", "data", "error", "tx_signatures", "transactions", "position_id"}
+    assert set(payload) <= {"ok", "data", "error", "tx_signatures", "transactions", "position_id", "id"}
+    request = json.loads((FIXTURES / "requests.json").read_text())[verb]
+    assert payload.get("id") == request.get("id")  # echoed on ok and bad_request alike
     assert result.tx_signatures == payload["tx_signatures"]
     assert len(result.tx_receipts) == len(payload["transactions"]) == len(result.tx_signatures)
     for signature, receipt, parsed in zip(result.tx_signatures, payload["transactions"], result.tx_receipts):

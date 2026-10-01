@@ -8,7 +8,7 @@ one response per stdout line.
 Verbs:
   deposit_single_sided(pool, side, bins, amounts, expected_active_bin,
                        max_active_bin_slippage, strategy_type) → tx signatures
-  withdraw(position_id, bps)                                   → tx signatures
+  withdraw(position_id, percent)                               → tx signatures
   swap(pool, in_mint, out_mint, amount, max_slippage_bps)       → swap result
   refresh_bundle(withdraw_pos, swap_spec, deposit_spec)        → bundle result
   get_state(pool)                                              → activeBin, bins, balances
@@ -132,18 +132,30 @@ class ExecResult:
 class ExecBridge:
     """Talks to the TS executor subprocess via JSON-lines."""
 
-    def __init__(self, cmd: list[str], cwd: str | None = None, timeout: float = 120.0):
+    def __init__(
+        self,
+        cmd: list[str],
+        cwd: str | None = None,
+        timeout: float = 120.0,
+        refresh_timeout: float = 420.0,
+    ):
         """
         cmd: e.g. ['node', 'executor/bridge.js']
         cwd: directory where the TS executor lives
-        timeout: per-request cap in seconds. Must exceed the executor's own 60 s
-            bundle deadline, or a slow-but-fine confirmation gets killed mid-flight.
+        timeout: per-request cap in seconds for single-transaction verbs and
+            reads. One confirmation is bounded by blockhash expiry (~150 blocks,
+            <=90 s) plus receipt retries (<=10 s); the Jito bundle deadline is 60 s.
+        refresh_timeout: cap for refresh_bundle. Sequentially (JITO_ENABLED=false,
+            how live runs go) it confirms up to 4 legs: withdraw, swap, bid, ask.
+        A kill below these budgets cuts a slow-but-fine confirmation mid-flight.
         """
         self.cmd = cmd
         self.cwd = cwd
         self.timeout = timeout
+        self.refresh_timeout = refresh_timeout
         self._proc: subprocess.Popen | None = None
         self._stderr_tail: deque[str] = deque(maxlen=50)
+        self._seq = 0
 
     def start(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -193,8 +205,11 @@ class ExecBridge:
         signed transaction may already be on chain, so callers must reconcile from
         chain state (get_state/get_position) before retrying a mutating verb.
         """
+        self._seq += 1
+        rid = f"x{self._seq}"  # echoed by the executor; joins its audit line to this call
         try:
-            line = json.dumps(request, allow_nan=False) + "\n"  # NaN/inf must never reach the signer
+            # NaN/inf must never reach the signer
+            line = json.dumps({**request, "id": rid}, allow_nan=False) + "\n"
         except ValueError as e:
             return ExecResult(ok=False, error=f"refusing to send non-finite value: {e}")
         if self._proc is None or self._proc.poll() is not None:
@@ -204,14 +219,17 @@ class ExecBridge:
         proc.stdin.write(line)
         proc.stdin.flush()
         # Killing the process unblocks readline (EOF) and guarantees a late reply can
-        # never be misread as the answer to the NEXT request (there are no request ids).
+        # never be misread as the answer to the NEXT request. Do not keep the child
+        # alive to await it: the keeper reconciles and may write again while an
+        # abandoned multi-leg refresh_bundle is still signing.
         timed_out = threading.Event()
 
         def _kill() -> None:
             timed_out.set()
             proc.kill()
 
-        timer = threading.Timer(self.timeout, _kill)
+        timeout = self.refresh_timeout if request.get("method") == "refresh_bundle" else self.timeout
+        timer = threading.Timer(timeout, _kill)
         timer.start()
         try:
             resp_line = proc.stdout.readline()
@@ -219,16 +237,25 @@ class ExecBridge:
             timer.cancel()
         if timed_out.is_set():
             logger.critical("executor timed out after %.0fs on %s; killed, outcome UNKNOWN",
-                            self.timeout, request.get("method"))
+                            timeout, request.get("method"))
             return ExecResult(ok=False, unknown_outcome=True,
-                              error=f"executor timeout after {self.timeout:.0f}s (killed; outcome unknown)")
+                              error=f"executor timeout after {timeout:.0f}s (killed; outcome unknown)")
         if not resp_line:
             tail = "\n".join(self._stderr_tail)
             return ExecResult(ok=False, unknown_outcome=True, error=f"executor EOF: {tail[-500:]}")
         try:
             raw = json.loads(resp_line)
-        except json.JSONDecodeError as e:
-            return ExecResult(ok=False, error=f"bad JSON from executor: {e}")
+        except json.JSONDecodeError:
+            raw = None
+        if not isinstance(raw, dict) or raw.get("id") != rid:
+            # Not our reply (stray stdout, desync). Our real reply may still be in the
+            # pipe for the next request to misread: fail closed exactly like a timeout.
+            proc.kill()
+            logger.critical("executor reply does not match %s on %s; killed, outcome UNKNOWN",
+                            rid, request.get("method"))
+            return ExecResult(ok=False, unknown_outcome=True,
+                              error=f"executor reply mismatch for {rid}: {resp_line[:200]!r} "
+                                    "(killed; outcome unknown)")
         return ExecResult.from_payload(raw)
 
     # -- Verb wrappers ------------------------------------------------
@@ -263,15 +290,15 @@ class ExecBridge:
             "strategy_type": strategy_type,
         })
 
-    def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        # Despite the name, the executor reads this as a PERCENT (100 = 100%); see
-        # solana-clmm-executor/src/withdraw.ts. Anything outside 1..100 is a caller bug.
-        if not isinstance(bps, int) or not 1 <= bps <= 100:
-            return ExecResult(ok=False, error=f"refusing withdraw: bps={bps!r} outside 1..100 (percent)")
+    def withdraw(self, position_id: str, percent: int = 100) -> ExecResult:
+        # Integer percent of the position (100 = full exit), not basis points. The
+        # executor rejects anything outside 1..100; refuse it here before spawning.
+        if not isinstance(percent, int) or not 1 <= percent <= 100:
+            return ExecResult(ok=False, error=f"refusing withdraw: percent={percent!r} outside 1..100")
         return self._send({
             "method": "withdraw",
             "position_id": position_id,
-            "bps": bps,
+            "percent": percent,
         })
 
     def swap(
@@ -396,8 +423,8 @@ class FakeExecBridge:
             strategy_type=strategy_type,
         )
 
-    def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        return self._record("withdraw", position_id=position_id, bps=bps)
+    def withdraw(self, position_id: str, percent: int = 100) -> ExecResult:
+        return self._record("withdraw", position_id=position_id, percent=percent)
 
     def swap(self, in_mint, out_mint, amount, pool, max_slippage_bps=50) -> ExecResult:
         return self._record(
@@ -533,10 +560,10 @@ class ReplayExecBridge:
             "strategy_type": strategy_type,
         })
 
-    def withdraw(self, position_id: str, bps: int = 100) -> ExecResult:
-        self.calls.append({"method": "withdraw", "position_id": position_id, "bps": bps})
+    def withdraw(self, position_id: str, percent: int = 100) -> ExecResult:
+        self.calls.append({"method": "withdraw", "position_id": position_id, "percent": percent})
         return self._next_result(
-            "withdraw", {"position_id": position_id, "bps": bps}
+            "withdraw", {"position_id": position_id, "percent": percent}
         )
 
     def swap(

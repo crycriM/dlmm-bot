@@ -25,13 +25,53 @@ class TestExecBridge:
             bridge.stop()
         assert not result.ok and result.unknown_outcome and "timeout" in result.error
 
+    def test_default_timeouts_exceed_executor_worst_case(self):
+        # Pinned from solana-clmm-executor: one confirmation <= 90 s blockhash
+        # expiry + <= 10 s receipt retries (transactions.ts RECEIPT_ATTEMPTS);
+        # Jito bundle deadline 60 s (bundle.ts DEFAULT_DEADLINE_MS); a sequential
+        # refresh_bundle confirms up to 4 legs (withdraw, swap, bid, ask).
+        leg = 90 + 10
+        bridge = ExecBridge(["/nonexistent-executor"])
+        assert bridge.timeout > max(leg, 60)
+        assert bridge.refresh_timeout > 4 * leg
+
+    def test_refresh_bundle_uses_its_own_timeout(self):
+        bridge = ExecBridge([sys.executable, "-c", "import time; time.sleep(60)"],
+                            timeout=60, refresh_timeout=0.3)
+        try:
+            result = bridge.refresh_bundle("pos", None, {})
+        finally:
+            bridge.stop()
+        assert result.unknown_outcome and "timeout after 0s" in result.error
+
+    @pytest.mark.parametrize("reply", [
+        '{"ok": true, "data": {}}',               # stray line, no id
+        '{"ok": true, "data": {}, "id": "x99"}',  # someone else's reply
+        "not json",
+    ])
+    def test_reply_id_mismatch_kills_and_flags_unknown_outcome(self, reply):
+        script = (
+            "import sys, time\n"
+            "sys.stdin.readline()\n"
+            f"print({reply!r}, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        bridge = py_bridge(script)
+        try:
+            result = bridge.get_state("pool")
+            proc = bridge._proc
+            assert proc.wait(timeout=5) is not None  # killed, not left to answer late
+        finally:
+            bridge.stop()
+        assert not result.ok and result.unknown_outcome and "mismatch" in result.error
+
     def test_stderr_flood_does_not_deadlock(self):
         # 300 KB of stderr before replying: fills the 64 KiB pipe unless it is drained
         script = (
             "import sys, json\n"
-            "sys.stdin.readline()\n"
+            "req = json.loads(sys.stdin.readline())\n"
             "sys.stderr.write('x' * 300000)\n"
-            "print(json.dumps({'ok': True, 'data': {}}), flush=True)\n"
+            "print(json.dumps({'ok': True, 'data': {}, 'id': req['id']}), flush=True)\n"
         )
         bridge = py_bridge(script, timeout=10)
         try:
@@ -51,8 +91,8 @@ class TestExecBridge:
         lambda b: b.swap("a", "b", float("nan"), "pool"),
         lambda b: b.swap("a", "b", 0.0, "pool"),
         lambda b: b.swap("a", "b", 1.0, "pool", max_slippage_bps=5000),
-        lambda b: b.withdraw("pos", bps=0),
-        lambda b: b.withdraw("pos", bps=101),
+        lambda b: b.withdraw("pos", percent=0),
+        lambda b: b.withdraw("pos", percent=101),
         lambda b: b.deposit_single_sided("pool", "bid", [1], [float("inf")],
                                          expected_active_bin=1, max_active_bin_slippage=0),
     ])

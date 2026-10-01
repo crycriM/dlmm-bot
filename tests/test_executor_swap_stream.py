@@ -45,7 +45,7 @@ def _build_rows(out_path: Path) -> list[dict]:
 
 
 @pytest.fixture(scope="module")
-def ts_stream_file(tmp_path_factory):
+def ts_stream_file(tmp_path_factory, fresh_executor_dist):
     if not FIXTURE.is_file():
         pytest.skip("dlmm-swap-logs.json fixture missing")
     if shutil.which("node") is None or not (EXECUTOR_DIR / "dist" / "bridge.js").is_file():

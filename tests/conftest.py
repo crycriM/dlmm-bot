@@ -123,10 +123,30 @@ class FixtureExecBridge(ExecBridge):
                     stream.close()
 
 
+@pytest.fixture(scope="session")
+def fresh_executor_dist():
+    """Fail when dist/ predates the executor sources: a stale build tests old code.
+
+    tsc re-emits every file on each build, so bridge.js's mtime is the build
+    time. Test files are excluded from dist, so editing them never trips this.
+    """
+    built = EXECUTOR_DIR / "dist" / "bridge.js"
+    if not built.is_file():
+        return  # callers decide whether a missing build skips or fails
+    sources = [p for p in (EXECUTOR_DIR / "src").rglob("*.ts") if not p.name.endswith(".test.ts")]
+    newest = max(sources, key=lambda p: p.stat().st_mtime)
+    if newest.stat().st_mtime > built.stat().st_mtime:
+        pytest.fail(
+            f"solana-clmm-executor/dist is older than {newest.relative_to(EXECUTOR_DIR)}; "
+            "run npm run build in solana-clmm-executor"
+        )
+
+
 @pytest.fixture
 def executor_env(request, monkeypatch, tmp_path):
     if not request.config.getoption("--executor-subprocess"):
         pytest.skip("enable with --executor-subprocess after npm run build in solana-clmm-executor")
+    request.getfixturevalue("fresh_executor_dist")
     node = shutil.which("node")
     if node is None or not (EXECUTOR_DIR / "dist" / "bridge.js").is_file():
         pytest.fail("Node and solana-clmm-executor/dist/bridge.js are required; run npm ci && npm run build")

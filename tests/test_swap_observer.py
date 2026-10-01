@@ -61,6 +61,16 @@ class TestFills:
                     "new_active_bin": new, "direction": label}, ts=2.0)
         assert [(f["bin_id"], f["side_filled"]) for f in _fills(log)] == [(101, side)]
 
+    @pytest.mark.parametrize("label", ["up", "down"])
+    def test_flat_swap_keeps_taker_direction_and_fills_nothing(self, grid, log, label):
+        ob = SwapObserver(log, grid, "p")
+        ob.register_ladder({100: 1.0}, position_id="PID")
+        ob.on_swap({"tx_signature": "S", "prev_active_bin": 100,
+                    "new_active_bin": 100, "direction": label}, ts=2.0)
+        trades = [e for e in load_events(log.path) if e["event_type"] == "observed_trade"]
+        assert [t["direction"] for t in trades] == [label]
+        assert _fills(log) == []
+
     def test_up_cross_sells_only_crossed_bids(self, grid, log):
         ob = SwapObserver(log, grid, "p")
         ob.set_last_mid(grid.price_from_bin(100), 1.0)

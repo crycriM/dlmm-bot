@@ -128,11 +128,16 @@ pytest
 The opt-in subprocess lane uses the sibling executor's deterministic offline
 handlers. It generates a test-only wallet key, reads required public IDs from
 the sibling's canonical fixtures, and uses a deliberately closed loopback RPC
-endpoint; it does not use a live wallet or pool:
+endpoint; it does not use a live wallet or pool. Build the executor first:
+the lane fails when `dist/` is older than the executor's `src/`.
 
 ```bash
+(cd ../solana-clmm-executor && npm run build)
 pytest --executor-subprocess
 ```
+
+`npm run check` in the executor does the build, both language suites, and
+this lane in one command.
 
 The test suite covers:
 

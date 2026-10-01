@@ -33,6 +33,10 @@ from live_keeper_write_soak import GATEWAY_ENV_KEYS
 EXECUTOR = Path(__file__).resolve().parents[2] / "solana-clmm-executor"
 
 
+class OpeningDrift(ValueError):
+    """The executor rejected a deposit before signing; a fresh plan is safe."""
+
+
 def build_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--pool", required=True)
@@ -95,12 +99,14 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     log = EventLog(str(run_dir / "run.jsonl"), config_hash=hashlib.sha256(
         json.dumps(vars(args), sort_keys=True).encode()).hexdigest())
     opened, proposed, legs = [], [], []
+    checked_legs = []
     baseline = grid = None
     initial_base = initial_quote = mid0 = mid = 0.0
     targets = {"lp_inventory_mark": 0.0, "lp_fee": 0.0}
     claimed = {"base": 0, "quote": 0}
     fees = 0
     signed = False
+    deployed = False
     unknown = False
     preflight_pass = False
     cleanup_complete = False
@@ -134,7 +140,10 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         unsubmitted = {"policy_rejected", "active_bin_slippage_exceeded", "bins_cross_active",
                        "insufficient_balance", "bad_request", "slippage_exceeded",
                        "simulation_failed", "unknown_position"}
-        unknown |= result.unknown_outcome or (not result.ok and result.error not in unsubmitted)
+        unknown = bool(unknown or result.unknown_outcome or (not result.ok and (
+            result.error not in unsubmitted or result.tx_signatures or result.tx_receipts
+            or result.total_fee_lamports is not None
+            or (result.data or {}).get("pending_signature"))))
         if result.total_fee_lamports is not None:
             fees += result.total_fee_lamports
             ledger.on_cash_flow("rebalance", time.time(),
@@ -142,6 +151,8 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         if not result.ok:
             if verb == "deposit_single_sided" and not unknown:
                 opened.remove(pid)  # proven pre-submission rejection: never adopt a later foreign position
+                if result.error == "active_bin_slippage_exceeded":
+                    raise OpeningDrift("deposit_single_sided failed: active_bin_slippage_exceeded")
             raise ValueError(f"{verb} failed: {result.error}")
         if (result.position_id or (result.data or {}).get("position_id")) != pid:
             unknown = True
@@ -216,6 +227,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                 or [p["side"] for p in inspected["positions"]] != [l["side"] for l in legs]
                 or any(p["exists"] for p in inspected["positions"])):
             raise ValueError("deposit PDA already exists or preflight is incomplete; never adopt it")
+        checked_legs = [dict(leg) for leg in legs]
         rent_sol = inspected["rent_lamports"] / 1e9
         if inspected["native_lamports"] / 1e9 < rent_sol + args.fee_budget_sol:
             raise ValueError("native SOL cannot cover temporary rent plus fee reserve")
@@ -226,15 +238,54 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
             reason, cleanup_complete = "preflight_only", True
         else:
             deadline = time.monotonic() + args.duration_seconds
-            for leg, pid in zip(legs, proposed):
-                if stop.is_set() or time.monotonic() >= deadline:
-                    raise ValueError("stopped before both positions opened")
-                if fees / 1e9 + .000045 >= args.fee_budget_sol:
-                    raise ValueError("fee budget cannot cover another deposit plus both closes")
-                # Track the *candidate* before submission, even if the reply is lost.
-                opened.append(pid)
-                action("deposit_single_sided", dict(pool=args.pool, **leg,
-                       expected_active_bin=active, max_active_bin_slippage=0), pid)
+            for index, template in enumerate(legs):
+                pid = inspected["positions"][index]["position_id"]
+                leg = dict(template)
+                for attempt in range(1, 4):
+                    if stop.is_set() or time.monotonic() >= deadline:
+                        raise ValueError("stopped before both positions opened")
+                    if fees / 1e9 + .000045 >= args.fee_budget_sol:
+                        raise ValueError("fee budget cannot cover another deposit plus both closes")
+                    fresh = state()  # never reuse the pool read from before account/rent preflight
+                    active = int(fresh["active_bin"])
+                    mid = grid.price_from_bin(active)
+                    if not deployed:
+                        if fresh["balances_raw"] != baseline:
+                            raise ValueError("wallet custody changed before opening")
+                        mid0 = mid
+                        initial_base = math.floor(initial_quote / mid * 10**grid.base_decimals) / 10**grid.base_decimals
+                        if int(baseline["base"]) < round(initial_base * 10**grid.base_decimals):
+                            raise ValueError("pre-funded base cannot cover the fresh opening price")
+                        legs[1]["amounts"] = [initial_base / args.width] * args.width
+                    lo = active - args.width if leg["side"] == "bid" else active + 1
+                    bins = list(range(lo, lo + args.width))
+                    if bins != leg["bin_ids"]:
+                        leg = dict(leg, bin_ids=bins)
+                        candidate = accounts(args, [leg])
+                        log.emit("opening_plan", attempt=attempt, expected_active_bin=active,
+                                 leg=leg, **candidate)
+                        positions = candidate["positions"]
+                        if (len(positions) != 1 or positions[0]["side"] != leg["side"]
+                                or positions[0]["exists"]):
+                            raise ValueError("fresh deposit PDA already exists or account preflight is incomplete")
+                        if candidate["native_lamports"] / 1e9 < candidate["rent_lamports"] / 1e9 + args.fee_budget_sol:
+                            raise ValueError("fresh deposit cannot retain rent and closing fee reserve")
+                        pid = positions[0]["position_id"]
+                        checked_legs.append(dict(leg))
+                        if pid not in proposed:
+                            proposed.append(pid)
+                    # Persist each fresh recovery handle before a request reaches the signer.
+                    opened.append(pid)
+                    try:
+                        action("deposit_single_sided", dict(pool=args.pool, **leg,
+                               expected_active_bin=active, max_active_bin_slippage=0), pid)
+                        deployed = True
+                        break
+                    except OpeningDrift:
+                        log.emit("opening_retry", side=leg["side"], attempt=attempt,
+                                 position_id=pid, reason="unsigned active-bin rejection")
+                        if attempt == 3:
+                            raise
             reason = "duration_elapsed"
             while True:
                 pnl = snapshot()
@@ -254,7 +305,8 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     except Exception as exc:
         error = str(exc)
         if preflight_pass:
-            reason = "unresolved_outcome" if unknown else "unsafe_read_or_action"
+            reason = ("unresolved_outcome" if unknown else "opening_rejected"
+                      if isinstance(exc, OpeningDrift) else "unsafe_read_or_action")
         log.emit("experiment_error", error=error, unresolved_outcome=unknown)
     finally:
         if args.live and preflight_pass and not unknown:
@@ -267,7 +319,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         continue
                     if not before.ok or not before.data or (before.data.get("owner"), before.data.get("pool")) != (args.wallet, args.pool):
                         raise ValueError("cleanup cannot verify owned position")
-                    result = action("withdraw", {"position_id": pid, "bps": 100}, pid)
+                    result = action("withdraw", {"position_id": pid, "percent": 100}, pid)
                     if not (result.data or {}).get("closed"):
                         raise ValueError("withdrawal did not confirm closure")
                     claim = result.data["fees_claimed"]
@@ -281,10 +333,11 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         break  # do not restart the executor or blindly resubmit
             if not opened and not unknown:
                 try:
-                    final_accounts = accounts(args, legs)
+                    final_accounts = accounts(args, checked_legs)
                     if any(p["exists"] for p in final_accounts["positions"]):
                         raise ValueError("position account still exists after closure")
-                    snapshot()
+                    if deployed:
+                        snapshot()
                     native_delta = final_accounts["native_lamports"] - inspected["native_lamports"]
                     log.emit("native_reconciliation", delta_lamports=native_delta,
                              receipt_fee_lamports=fees, unexplained_lamports=native_delta + fees)
@@ -299,7 +352,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                   "unresolved_outcome": unknown, "remaining_position_ids": opened,
                   "expected_position_ids": proposed, "fee_lamports": fees, "error": error,
                   "inventory_mark_pnl": targets["lp_inventory_mark"],
-                  "idle_hold_pnl": initial_base * (mid - mid0),
+                  "idle_hold_pnl": initial_base * (mid - mid0) if deployed else 0.0,
                   "pnl": ledger.explain(mid=mid, include_events=False).to_dict() if mid > 0 else None,
                   "fee_attribution": "position entitlement; post-read withdrawal accrual may enter principal residual"}
         log.emit("run_stopped", **report)

@@ -26,10 +26,12 @@ class Bridge:
         self.wallet = {"base": 1_000_000_000, "quote": 20_000_000}
         self.failure = failure
         self.native = 1_000_000_000
+        self.active_bin = 0
+        self.address = lambda side, bins: side
 
     def get_state(self, pool):
         return ExecResult(ok=True, data={
-            "active_bin": 0, "bin_step_bps": 4, "slot": 1,
+            "active_bin": self.active_bin, "bin_step_bps": 4, "slot": 1,
             "fetched_at": experiment.time.time(),
             "token_x": {"mint": "base", "decimals": 9},
             "token_y": {"mint": "quote", "decimals": 6},
@@ -44,7 +46,7 @@ class Bridge:
     def deposit_single_sided(self, **kwargs):
         self.calls.append(("deposit", kwargs))
         side = kwargs["side"]
-        pid = side
+        pid = self.address(side, kwargs["bin_ids"])
         token, decimals = ("base", 9) if side == "ask" else ("quote", 6)
         raw = round(sum(kwargs["amounts"]) * 10**decimals)
         self.wallet[token] -= raw
@@ -62,8 +64,8 @@ class Bridge:
         return ExecResult(ok=True, position_id=pid, fee_lamports=5000,
                           tx_signatures=[f"deposit-{side}"])
 
-    def withdraw(self, position_id, bps):
-        self.calls.append(("withdraw", position_id, bps))
+    def withdraw(self, position_id, percent):
+        self.calls.append(("withdraw", position_id, percent))
         pos = self.positions.pop(position_id)
         self.native -= 5000
         self.wallet["base"] += round(pos["total_base"] * 1e9)
@@ -80,18 +82,23 @@ def args(tmp_path):
     return experiment.build_args([
         "--pool", "pool", "--base-mint", "base", "--quote-mint", "quote",
         "--wallet", "wallet", "--out", str(tmp_path), "--live",
-        "--duration-seconds", "0.02", "--refresh-interval", "0.001",
+        "--duration-seconds", "0.05", "--refresh-interval", "0.001",
     ])
 
 
-def accounts(*_):
-    return {"native_lamports": 1_000_000_000, "rent_lamports": 120_000_000,
-            "positions": [{"side": "bid", "position_id": "bid", "exists": False},
-                          {"side": "ask", "position_id": "ask", "exists": False}]}
+def accounts(_, legs):
+    return {"native_lamports": 1_000_000_000, "rent_lamports": 60_000_000 * len(legs),
+            "positions": [{"side": leg["side"], "position_id": leg["side"], "exists": False}
+                          for leg in legs]}
 
 
 def account_reader(bridge):
-    return lambda *a: accounts(*a) | {"native_lamports": bridge.native}
+    def read(a, legs):
+        return accounts(a, legs) | {"native_lamports": bridge.native,
+            "positions": [{"side": leg["side"],
+                           "position_id": bridge.address(leg["side"], leg["bin_ids"]),
+                           "exists": False} for leg in legs]}
+    return read
 
 
 @pytest.fixture(autouse=True)
@@ -205,3 +212,97 @@ def test_protocol_ambiguous_error_without_transport_flag_stops_all_writes(tmp_pa
     assert report["cleanup_complete"] is False
     assert report["remaining_position_ids"] == ["bid"]
     assert bridge.calls == []
+
+
+class MovingBridge(Bridge):
+    def __init__(self, rejects=1, side="bid", ambiguous=False):
+        super().__init__()
+        self.rejects, self.side, self.ambiguous = rejects, side, ambiguous
+        self.address = lambda side, bins: f"{side}:{bins[0]}"
+
+    def deposit_single_sided(self, **kwargs):
+        if kwargs["side"] == self.side and self.rejects:
+            self.calls.append(("rejected", kwargs))
+            self.rejects -= 1
+            self.active_bin += 1
+            return ExecResult(ok=False, error="active_bin_slippage_exceeded")
+        if self.ambiguous:
+            self.calls.append(("ambiguous", kwargs))
+            return ExecResult(ok=False, unknown_outcome=True, error="timeout")
+        return super().deposit_single_sided(**kwargs)
+
+
+def test_opening_replans_after_unsigned_drift_and_keeps_zero_tolerance(tmp_path):
+    bridge = MovingBridge()
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["cleanup_complete"] is True
+    assert report["error"] is None
+    assert [c[0] for c in bridge.calls] == ["rejected", "deposit", "deposit", "withdraw", "withdraw"]
+    assert bridge.calls[0][1]["expected_active_bin"] == 0
+    assert bridge.calls[1][1]["expected_active_bin"] == 1
+    assert bridge.calls[1][1]["bin_ids"] == [-4, -3, -2, -1, 0]
+    assert all(c[1]["max_active_bin_slippage"] == 0 for c in bridge.calls[:3])
+    assert len(ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")) == 1
+    assert "bid:-4" in report["expected_position_ids"]
+
+
+def test_three_unsigned_rejections_stop_with_zero_experiment_pnl(tmp_path):
+    bridge = MovingBridge(rejects=20)
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert len(bridge.calls) == 3
+    assert all(c[0] == "rejected" for c in bridge.calls)
+    assert report["cleanup_complete"] is True
+    assert report["live_started"] is False
+    assert report["fee_lamports"] == 0
+    assert report["inventory_mark_pnl"] == 0
+    assert report["idle_hold_pnl"] == 0
+    assert report["pnl"]["total_pnl"] == 0
+
+
+def test_ask_retry_exhaustion_closes_only_the_successful_bid(tmp_path):
+    bridge = MovingBridge(rejects=20, side="ask")
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert [c[0] for c in bridge.calls] == ["deposit", "rejected", "rejected", "rejected", "withdraw"]
+    assert report["cleanup_complete"] is True
+    assert report["remaining_position_ids"] == []
+    assert report["fee_lamports"] == 10000
+
+
+def test_ambiguous_reply_after_unsigned_retry_stops_without_cleanup_writes(tmp_path):
+    bridge = MovingBridge(ambiguous=True)
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert [c[0] for c in bridge.calls] == ["rejected", "ambiguous"]
+    assert report["unresolved_outcome"] is True
+    assert report["cleanup_complete"] is False
+    assert report["remaining_position_ids"] == ["bid:-4"]
+
+
+def test_pool_movement_during_account_preflight_is_replanned_before_first_deposit(tmp_path):
+    bridge = MovingBridge(rejects=0)
+    read = account_reader(bridge)
+    first = True
+    def delayed(a, legs):
+        nonlocal first
+        data = read(a, legs)
+        if first:
+            first = False
+            bridge.active_bin = 2
+        return data
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), delayed)
+    assert report["error"] is None
+    assert bridge.calls[0][0] == "deposit"
+    assert bridge.calls[0][1]["expected_active_bin"] == 2
+    assert bridge.calls[0][1]["bin_ids"] == [-3, -2, -1, 0, 1]
+    assert report["cleanup_complete"] is True
+
+
+def test_drift_error_with_receipt_evidence_is_never_retried(tmp_path):
+    bridge = Bridge()
+    bridge.deposit_single_sided = lambda **_: ExecResult(
+        ok=False, error="active_bin_slippage_exceeded", tx_signatures=["maybe-landed"],
+    )
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["unresolved_outcome"] is True
+    assert report["cleanup_complete"] is False
+    assert report["remaining_position_ids"] == ["bid"]
+    assert not ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")

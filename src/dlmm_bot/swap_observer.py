@@ -16,7 +16,8 @@ dict and feeds it to SwapObserver.on_swap(). The observer:
 
 Payload fields (decoded by the stream source):
   tx_signature (str, dedupe key), slot (int), block_time (int),
-  direction ("up"|"down"), prev_active_bin (int), new_active_bin (int),
+  direction ("up"|"down", taker side; used only for flat swaps — when the
+  bin moves, prev/new decide it), prev_active_bin (int), new_active_bin (int),
   amount_in/amount_out (decimal, optional *_raw for on-chain integers),
   trade_size_usd (float, optional), fee_bps (float, optional), tvl_usd
 """

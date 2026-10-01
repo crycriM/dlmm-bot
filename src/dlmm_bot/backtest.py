@@ -176,7 +176,7 @@ class DLMMBacktester:
 
     def _swap_base_out(self, ts: float, mid: float, min_base: float, label: str) -> None:
         """ponytail: swap fills at mid, no price impact — add the sqrt impact
-        model once Jupiter swap fills are measured."""
+        model once live de-risk swap fills (direct DLMM pool) are measured."""
         if self.base > min_base:
             self._book_fill(Fill(ts=ts, side="sell", price=mid, size=self.base,
                                  mid_at_fill=mid, label=label))

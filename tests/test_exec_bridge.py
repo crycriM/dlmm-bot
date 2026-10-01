@@ -48,10 +48,10 @@ class TestFakeExecBridge:
         assert call["max_active_bin_slippage"] == 1
 
     def test_withdraw(self):
-        result = self.bridge.withdraw("pos_001", bps=50)
+        result = self.bridge.withdraw("pos_001", percent=50)
         assert result.ok
         assert self.bridge.calls[0]["position_id"] == "pos_001"
-        assert self.bridge.calls[0]["bps"] == 50
+        assert self.bridge.calls[0]["percent"] == 50
 
     def test_swap(self):
         result = self.bridge.swap(
@@ -97,7 +97,9 @@ class TestExecBridgeProtocol:
             def write(self, s): captured_stdin.append(s)
             def flush(self): pass
         class FakeStdout:
-            def readline(self): return '{"ok": true, "data": {"active_bin": 50}}'
+            def readline(self):
+                rid = json.loads(captured_stdin[-1])["id"]
+                return json.dumps({"ok": True, "data": {"active_bin": 50}, "id": rid})
         class FakeStderr:
             def read(self): return ""
         class FakeProc:

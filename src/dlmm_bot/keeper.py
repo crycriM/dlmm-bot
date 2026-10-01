@@ -828,7 +828,7 @@ class Keeper:
         remaining: list[str] = []
         for position_id in self._extra_position_ids:
             req_id = self._next_req_id()
-            payload = {"position_id": position_id, "bps": 100}
+            payload = {"position_id": position_id, "percent": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
             self._emit_result(req_id, "withdraw", result, tag)
@@ -837,7 +837,7 @@ class Keeper:
                 self.emit(
                     "position_withdrawn",
                     position_id=position_id,
-                    bps=100,
+                    percent=100,
                     fees_claimed=data.get("fees_claimed"),
                     amounts_returned=data.get("amounts_returned"),
                     **self._chain_fields(result),
@@ -1094,7 +1094,7 @@ class Keeper:
             self.emit(
                 "position_withdrawn",
                 position_id=old_pid,
-                bps=100,
+                percent=100,
                 fees_claimed=data.get("fees_claimed"),
                 amounts_returned=data.get("amounts_returned"),
                 **self._chain_fields(result),
@@ -1120,7 +1120,7 @@ class Keeper:
             return
         if self._current_position_id:
             req_id = self._next_req_id()
-            payload = {"position_id": self._current_position_id, "bps": 100}
+            payload = {"position_id": self._current_position_id, "percent": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
             self._emit_result(req_id, "withdraw", result, "stop_quoting_gas")
@@ -1129,7 +1129,7 @@ class Keeper:
                 self.emit(
                     "position_withdrawn",
                     position_id=self._current_position_id,
-                    bps=100,
+                    percent=100,
                     fees_claimed=data.get("fees_claimed"),
                     amounts_returned=data.get("amounts_returned"),
                     **self._chain_fields(result),
@@ -1143,7 +1143,7 @@ class Keeper:
                 logger.error("Withdraw failed: %s", result.error)
 
     async def _de_risk(self) -> None:
-        """De-risk: stop bids, drain asks, TWAP remainder over Jupiter."""
+        """De-risk: withdraw, then swap the base remainder to quote through our own pool."""
         self._ensure_run_started()
         if self.cfg.dry_run:
             logger.info("[DRY-RUN] Would de-risk (stop bids, drain asks, TWAP)")
@@ -1151,7 +1151,7 @@ class Keeper:
         # Step 1: withdraw current position
         if self._current_position_id:
             req_id = self._next_req_id()
-            payload = {"position_id": self._current_position_id, "bps": 100}
+            payload = {"position_id": self._current_position_id, "percent": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
             self._emit_result(req_id, "withdraw", result, "de_risk_withdraw")
@@ -1162,7 +1162,7 @@ class Keeper:
             self.emit(
                 "position_withdrawn",
                 position_id=self._current_position_id,
-                bps=100,
+                percent=100,
                 fees_claimed=data.get("fees_claimed"),
                 amounts_returned=data.get("amounts_returned"),
                 **self._chain_fields(result),
@@ -1172,9 +1172,9 @@ class Keeper:
             if self.swap_observer is not None:
                 self.swap_observer.clear()
 
-        # Step 2: TWAP the remainder via Jupiter swap
-        # In production, this would chunk the remaining inventory into N
-        # depth-checked swaps. For now, a single swap to safe leg.
+        # Step 2: swap the remainder to the safe leg through our own DLMM pool —
+        # the executor has no aggregator route. ponytail: one swap; chunk it
+        # into depth-checked slices (quote_swap) if size ever exceeds pool depth.
         if self._inventory_base > 0.01:
             req_id = self._next_req_id()
             payload = {
@@ -1203,7 +1203,7 @@ class Keeper:
         # Withdraw everything
         if self._current_position_id:
             req_id = self._next_req_id()
-            payload = {"position_id": self._current_position_id, "bps": 100}
+            payload = {"position_id": self._current_position_id, "percent": 100}
             self._emit_action(req_id, "withdraw", payload)
             result = self.exec.withdraw(**payload)
             self._emit_result(req_id, "withdraw", result, "emergency_withdraw")
