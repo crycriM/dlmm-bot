@@ -7,7 +7,8 @@
 # adverse perp funding rate (negative = the short pays, so the hedge costs).
 #
 # Usage: tools/pp_soak_2h.sh <swaps.jsonl> <depth.jsonl> [out.json]
-# Env:   WINDOW_H=2 HAIRCUT=0.5 FUNDING_APR=-0.05 POOL=<addr> PY=.venv/bin/python
+# Env:   WINDOW_H=2 HAIRCUT=0.5 FUNDING_APR=-0.05 PROTOCOL_FEE_PCT=10
+#        POOL=<addr> PY=.venv/bin/python
 set -euo pipefail
 
 SWAPS="${1:?usage: pp_soak_2h.sh <swaps.jsonl> <depth.jsonl> [out.json]}"
@@ -17,6 +18,7 @@ OUT="${3:-logs/calibration/pp-2h-$(date -u +%Y%m%dT%H%M%SZ).json}"
 WINDOW_H="${WINDOW_H:-2}"
 HAIRCUT="${HAIRCUT:-0.5}"
 FUNDING_APR="${FUNDING_APR:--0.05}"
+PROTOCOL_FEE_PCT="${PROTOCOL_FEE_PCT:-10}"
 POOL="${POOL:-5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6}"
 PY="${PY:-.venv/bin/python}"
 
@@ -29,4 +31,5 @@ mkdir -p "$(dirname "$OUT")"
   --window-hours "$WINDOW_H" \
   --width 5,10,20,40 --tau 900,3600,14400 \
   --in-bin-haircut "$HAIRCUT" --funding-apr "$FUNDING_APR" \
+  --protocol-fee-pct "$PROTOCOL_FEE_PCT" \
   --depth "$DEPTH" --json "$OUT"

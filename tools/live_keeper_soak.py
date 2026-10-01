@@ -39,7 +39,7 @@ def required(name: str) -> str:
     return value
 
 
-def validate_read_only() -> None:
+def validate_read_only(pool_only: bool = False) -> None:
     if os.environ.get("RUN_LIVE") != "1":
         raise ValueError("RUN_LIVE=1 is required")
     if os.environ.get("DRY_RUN", "true").lower() != "true":
@@ -51,10 +51,12 @@ def validate_read_only() -> None:
                 and SECRET_ENV.search(key)):
             raise ValueError(f"secret-bearing environment variable is forbidden: {key}")
     for name in (
-        "SOLANA_RPC_URL", "LIVE_POOL", "LIVE_POSITION_ID", "WALLET_PUBKEY",
+        "SOLANA_RPC_URL", "LIVE_POOL", "WALLET_PUBKEY",
         "LIVE_BASE_MINT", "LIVE_QUOTE_MINT",
     ):
         required(name)
+    if not pool_only:
+        required("LIVE_POSITION_ID")
     if not (EXECUTOR / "dist" / "bridge.js").is_file():
         raise ValueError("executor dist/bridge.js is missing; run npm run build")
 
@@ -66,6 +68,7 @@ def configure_executor(output: Path) -> None:
         "SOLANA_RPC_WRITE_URL", "SOLANA_WS_URL", "SOLANA_COMMITMENT",
         "SOLANA_RPC_MAX_CU_PER_SECOND", "LIVE_POOL", "LIVE_POSITION_ID",
         "LIVE_BASE_MINT", "LIVE_QUOTE_MINT", "WALLET_PUBKEY",
+        "DEPTH_SAMPLE_INTERVAL_S",
     )
     inherited = {key: os.environ[key] for key in allowed if key in os.environ}
     os.environ.clear()  # ExecBridge inherits env; never forward unrelated credentials.
@@ -85,12 +88,19 @@ def configure_executor(output: Path) -> None:
         "SWAP_STREAM_PATH": str(output / "swaps.jsonl"),
         "EXECUTOR_LOG_DIR": str(output / "executor"),
     })
+    if os.environ.get("DEPTH_SAMPLE_INTERVAL_S"):
+        os.environ["DEPTH_SAMPLE_PATH"] = str(output / f"depth-{required('LIVE_POOL')}.jsonl")
 
 
-def grid_from_reads(state: dict, position: dict) -> VenueGrid:
+def grid_from_reads(state: dict, position: dict | None = None) -> VenueGrid:
     step = int(state["bin_step_bps"])
     if step <= 0:
         raise ValueError("live pool bin step must be positive")
+    if position is None:
+        base_decimals = int(state["token_x"]["decimals"])
+        quote_decimals = int(state["token_y"]["decimals"])
+        return VenueGrid(10 ** (base_decimals - quote_decimals), step,
+                         base_decimals, quote_decimals)
     active = int(state["active_bin"])
     priced = [
         row for row in position.get("bins", [])
@@ -138,7 +148,8 @@ def executor_lines(directory: Path) -> list[dict]:
     return rows
 
 
-def summarize(output: Path, elapsed: float, minimum_seconds: float) -> dict:
+def summarize(output: Path, elapsed: float, minimum_seconds: float,
+              pool_only: bool = False) -> dict:
     minimum_seconds = max(minimum_seconds, MINIMUM_SOAK_SECONDS)
     keeper_paths = list((output / "keeper").glob("*.jsonl"))
     if len(keeper_paths) != 1:
@@ -157,7 +168,7 @@ def summarize(output: Path, elapsed: float, minimum_seconds: float) -> dict:
     complete = (
         elapsed >= minimum_seconds
         and bool(state_events)
-        and len(position_events) == len(state_events)
+        and len(position_events) == (0 if pool_only else len(state_events))
         and all(row.get("state") is not None for row in state_events)
         and all(
             row.get("ok") is True
@@ -183,7 +194,10 @@ def summarize(output: Path, elapsed: float, minimum_seconds: float) -> dict:
         "get_state_p95_ms": p95,
         "max_get_state_p95_ms": MAX_STATE_P95_MS,
         "read_only": no_writes and started.get("dry_run") is True,
-        "gate_pass": complete,
+        "pool_only": pool_only,
+        "pool_read_gate_pass": complete,
+        # Pool-only reads do not prove the M2 owned-position read gate.
+        "gate_pass": complete and not pool_only,
         "keeper_log": str(keeper_paths[0]),
     }
 
@@ -199,6 +213,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration-seconds", type=float, default=1800)
     parser.add_argument("--interval-seconds", type=float, default=10)
+    parser.add_argument("--pool-only", action="store_true",
+                        help="observe state without an existing LP position; does not qualify the M2 position gate")
     parser.add_argument("--revalidate-existing", type=Path,
                         help="reassess retained evidence without a new live run")
     args = parser.parse_args()
@@ -206,17 +222,19 @@ def main() -> int:
         output = args.revalidate_existing.resolve()
         previous = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         summary = summarize(output, float(previous["elapsed_seconds"]),
-                            float(previous["minimum_seconds"]))
+                            float(previous["minimum_seconds"]),
+                            pool_only=previous.get("pool_only", False))
         target = output / f"gate-validation-{MAX_STATE_P95_MS}ms.json"
         with target.open("x", encoding="utf-8") as artifact:
             json.dump({"source_summary": str(output / "summary.json"), **summary},
                       artifact, indent=2)
             artifact.write("\n")
         print(json.dumps({"artifact": str(target), **summary}))
-        return 0 if summary["gate_pass"] else 1
+        passed = summary["pool_read_gate_pass"] if summary["pool_only"] else summary["gate_pass"]
+        return 0 if passed else 1
     if args.duration_seconds <= 0 or args.interval_seconds <= 0:
         parser.error("duration and interval must be positive")
-    validate_read_only()
+    validate_read_only(pool_only=args.pool_only)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = EXECUTOR / "logs" / "test-artifacts" / f"evidence-keeper-m2-{stamp}"
     output.mkdir(parents=True, exist_ok=False)
@@ -226,12 +244,12 @@ def main() -> int:
     started_at = 0.0
     try:
         state = bridge.get_state(required("LIVE_POOL"))
-        position = bridge.get_position(required("LIVE_POSITION_ID"))
+        position = None if args.pool_only else bridge.get_position(required("LIVE_POSITION_ID"))
         if not state.ok or not isinstance(state.data, dict):
             raise RuntimeError("live get_state preflight failed")
-        if not position.ok or not isinstance(position.data, dict):
+        if position is not None and (not position.ok or not isinstance(position.data, dict)):
             raise RuntimeError("live get_position preflight failed")
-        grid = grid_from_reads(state.data, position.data)
+        grid = grid_from_reads(state.data, position.data if position else None)
         cfg = KeeperConfig(
             dlmm=DLMMConfig(
                 gamma=0.0, kappa=0.0, bin_step_bps=grid.bin_step_bps,
@@ -240,7 +258,7 @@ def main() -> int:
             grid=grid,
             refresh_interval=args.interval_seconds,
             pool_address=required("LIVE_POOL"),
-            position_id=required("LIVE_POSITION_ID"),
+            position_id=None if args.pool_only else required("LIVE_POSITION_ID"),
             base_mint=required("LIVE_BASE_MINT"),
             quote_mint=required("LIVE_QUOTE_MINT"),
             dry_run=True,
@@ -256,10 +274,11 @@ def main() -> int:
             keeper.stop()
         close_bridge(bridge)
     elapsed = time.monotonic() - started_at
-    summary = summarize(output, elapsed, args.duration_seconds)
+    summary = summarize(output, elapsed, args.duration_seconds, pool_only=args.pool_only)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"artifact_dir": str(output), **summary}))
-    return 0 if summary["gate_pass"] else 1
+    passed = summary["pool_read_gate_pass"] if args.pool_only else summary["gate_pass"]
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

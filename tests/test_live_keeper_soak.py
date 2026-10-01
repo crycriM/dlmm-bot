@@ -33,6 +33,13 @@ def test_grid_uses_owned_position_price_and_live_pool_decimals():
     assert (grid.base_decimals, grid.quote_decimals) == (9, 6)
 
 
+def test_pool_only_grid_uses_raw_ratio_and_does_not_require_a_position():
+    grid = soak.grid_from_reads({"bin_step_bps": 4, "token_x": {"decimals": 9},
+                                 "token_y": {"decimals": 6}})
+    assert grid.ref_price == 1000.0
+    assert grid.price_from_bin(-5350) == pytest.approx(117.7051966423142)
+
+
 def test_executor_environment_drops_unrelated_credentials(tmp_path):
     with patch.dict(os.environ, {
         "PATH": "/usr/bin",
@@ -41,6 +48,7 @@ def test_executor_environment_drops_unrelated_credentials(tmp_path):
         "LIVE_POOL": "pool",
         "LIVE_BASE_MINT": "base",
         "LIVE_QUOTE_MINT": "quote",
+        "DEPTH_SAMPLE_INTERVAL_S": "5",
         "HYPERLIQUID_PRIVATE_KEY": "must-not-pass",
     }, clear=True):
         soak.configure_executor(tmp_path)
@@ -49,6 +57,7 @@ def test_executor_environment_drops_unrelated_credentials(tmp_path):
         assert os.environ["MAX_SOL_PER_TX"] == "0"
         assert os.environ["JITO_ENABLED"] == "false"
         assert os.environ["POOL_ALLOWLIST"] == "pool"
+        assert os.environ["DEPTH_SAMPLE_PATH"] == str(tmp_path / "depth-pool.jsonl")
 
 
 @pytest.mark.parametrize("unsafe", [
@@ -123,4 +132,21 @@ def test_short_diagnostic_cannot_pass_soak_gate(tmp_path, monkeypatch):
     summary = soak.summarize(tmp_path, 60, 60)
 
     assert summary["minimum_seconds"] == 1800
+    assert summary["gate_pass"] is False
+
+
+def test_pool_only_observations_do_not_qualify_position_gate(tmp_path, monkeypatch):
+    (tmp_path / "keeper").mkdir()
+    (tmp_path / "keeper" / "run.jsonl").touch()
+    monkeypatch.setattr(soak, "ReplayLog", lambda _: type("Log", (), {"events": lambda self: [
+        {"event_type": "state_observation", "state": {"active_bin": 1}},
+        {"event_type": "decision", "action": "observation_only"},
+    ]})())
+    monkeypatch.setattr(soak, "executor_lines", lambda _: [
+        {"kind": "executor_started", "dry_run": True},
+        {"kind": "verb", "method": "get_state", "duration_ms": 100,
+         "response": {"ok": True}},
+    ])
+    summary = soak.summarize(tmp_path, 1800, 1800, pool_only=True)
+    assert summary["pool_read_gate_pass"] is True
     assert summary["gate_pass"] is False

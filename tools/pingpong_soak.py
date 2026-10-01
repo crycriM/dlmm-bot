@@ -26,7 +26,6 @@ import argparse
 import bisect
 import itertools
 import json
-import statistics
 import sys
 from typing import Callable
 
@@ -47,6 +46,7 @@ def simulate(
     perp_cost_bps: float = 5.0, funding_apr: float = 0.0,
     pool_bin_quote: float | Callable[[BinEvent], float] = 0.0,
     in_bin_haircut: float = 1.0,
+    protocol_fee_pct: float = 0.0,
 ) -> dict:
     """One run: the LP leg alone, the perp hedge, and their sum.
 
@@ -58,6 +58,9 @@ def simulate(
     no queue priority, no time in book and no self-trade effect, so it is an
     upper bound; a haircut re-checks the gate under a lower fill assumption.
     """
+    if not 0 <= protocol_fee_pct <= 100:
+        raise ValueError("protocol_fee_pct must be between 0 and 100")
+    lp_fee_share = 1.0 - protocol_fee_pct / 100
     lp, perp = PnLLedger("meteora", "pingpong"), PnLLedger("hl", "hedge")
     first = events[0]
     mid = mid0 = grid.price_from_bin(first.prev_active_bin)
@@ -130,7 +133,7 @@ def simulate(
                 cell[0] += size
             lp.on_fill(Fill(e.ts, "sell" if up else "buy", price, size,
                             mid_at_fill=prev_mid, label="bin_flip"))
-            fee = size * price * e.fee_bps / 1e4  # claimable, not compounded
+            fee = size * price * e.fee_bps / 1e4 * lp_fee_share  # claimable, not compounded
             fees += fee
             lp.on_cash_flow("lp_fee", e.ts, fee, label=f"bin_{b}_fee")
             n_flips += 1
@@ -141,7 +144,7 @@ def simulate(
             # is ignored (it mostly reverts in-bin).
             ours = cell[0] * mid + cell[1]
             depth = pool_bin_quote(e) if callable(pool_bin_quote) else pool_bin_quote
-            fee = (e.trade_size_usd * e.fee_bps / 1e4 * ours / (depth + ours)
+            fee = (e.trade_size_usd * e.fee_bps / 1e4 * lp_fee_share * ours / (depth + ours)
                    * in_bin_haircut)
             fees += fee
             in_bin_fees += fee
@@ -208,28 +211,37 @@ def estimate_pool_bin_quote(events: list[BinEvent]) -> float:
     return per_bin[len(per_bin) // 2] if per_bin else 0.0
 
 
-def depth_at(path: str, base_decimals: int, quote_decimals: int) -> Callable[[BinEvent], float]:
-    """Executor depth-sampler rows (DEPTH_SAMPLE_PATH) -> pool quote value of
-    the event's active bin in the latest sample at or before it; the sample's
-    median bin when that bin was not sampled. Error rows are skipped."""
-    samples = []
+def depth_at(path: str, base_decimals: int, quote_decimals: int,
+             max_age_seconds: float = 15.0) -> Callable[[BinEvent], float]:
+    """Depth of the traded bin from a preceding, fresh sample of its pool.
+
+    Missing, stale or unsampled depth yields infinity (zero fee credit),
+    rather than substituting a future sample or another bin's reserves.
+    Error rows are skipped. Timestamps are compared with swap block_time.
+    """
+    samples: dict[str, list] = {}
     with open(path) as fh:
         for line in fh:
             row = json.loads(line) if line.strip() else {}
             if row.get("bins"):
-                samples.append((row["ts"], {
+                samples.setdefault(row["pool"], []).append((row["ts"], {
                     b["bin_id"]: int(b["x_raw"]) / 10 ** base_decimals * b["price"]
                     + int(b["y_raw"]) / 10 ** quote_decimals
                     for b in row["bins"]}))
     if not samples:
         raise ValueError(f"no depth samples in {path}")
-    samples.sort(key=lambda s: s[0])
-    times = [t for t, _ in samples]
+    for rows in samples.values():
+        rows.sort(key=lambda s: s[0])
+    times = {pool: [t for t, _ in rows] for pool, rows in samples.items()}
 
     def lookup(e: BinEvent) -> float:
-        # ponytail: before the first sample, use the first; no staleness cap.
-        book = samples[max(bisect.bisect_right(times, e.ts) - 1, 0)][1]
-        return book.get(e.active_bin, statistics.median(book.values()))
+        index = bisect.bisect_right(times.get(e.pool, []), e.ts) - 1
+        if index < 0:
+            return float("inf")
+        sample_ts, book = samples[e.pool][index]
+        if e.ts - sample_ts > max_age_seconds:
+            return float("inf")
+        return book.get(e.prev_active_bin, float("inf"))
     return lookup
 
 
@@ -240,14 +252,14 @@ def soak(events, grid, widths, shifts, taus, split, **kw) -> list[dict]:
     for w, s, t in itertools.product(widths, shifts, taus):
         row = simulate(events, grid, width=w, shift=s, tau=t, **kw)
         halves = [events[:cut], events[cut:]] if cut else []
-        row["halves"] = [{k: simulate(h, grid, width=w, shift=s, tau=t, **kw)[k]
-                          for k in HALF_KEYS} for h in halves]
-        # Gate: the hedged book makes money on the whole capture and on each
-        # half, and the hedge actually shrinks the drawdown it exists for.
+        half_runs = [simulate(h, grid, width=w, shift=s, tau=t, **kw) for h in halves]
+        row["halves"] = [{k: result[k] for k in HALF_KEYS} for result in half_runs]
+        # Gate: beat both zero and the idle hold on the full run and each
+        # half; the hedge must also shrink drawdown.
         row["gate_pass"] = (
-            row["hedged_total"] > 0
+            row["hedged_total"] > max(0.0, row["idle_hold"])
             and row["max_dd_hedged"] < row["max_dd_lp"]
-            and all(h["hedged_total"] > 0 for h in row["halves"])
+            and all(h["hedged_total"] > max(0.0, h["idle_hold"]) for h in row["halves"])
         )
         rows.append(row)
     return rows
@@ -284,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="taker fee + half spread per hedge trade")
     ap.add_argument("--funding-apr", type=float, default=0.0,
                     help="perp funding, annualized; positive pays the short")
+    ap.add_argument("--protocol-fee-pct", type=float, default=0.0,
+                    help="percent of swap fees retained by the protocol; 0 gives a gross-fee bound")
     ap.add_argument("--gas-lamports", type=int, default=30_000,
                     help="SOL fee per on-chain action (withdraw / deposit)")
     ap.add_argument("--sol-price", type=float, default=None,
@@ -291,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
     depth_src = ap.add_mutually_exclusive_group()
     depth_src.add_argument("--depth", default=None,
                            help="executor depth-sampler JSONL (DEPTH_SAMPLE_PATH): measured depth")
+    ap.add_argument("--depth-max-age-seconds", type=float, default=15.0,
+                    help="maximum age of preceding depth; use 120 for 60-second samples")
     depth_src.add_argument("--pool-bin-quote", type=float, default=None,
                            help="pool liquidity per bin near the active bin, quote units; "
                                 "default: estimated from multi-bin swaps; 0 = no in-bin fees")
@@ -325,7 +341,8 @@ def main(argv: list[str] | None = None) -> int:
         sol_price = mids[len(mids) // 2]
     gas_cost = args.gas_lamports * 1e-9 * sol_price
     if args.depth:
-        pool_bin_quote = depth_at(args.depth, args.base_decimals, args.quote_decimals)
+        pool_bin_quote = depth_at(args.depth, args.base_decimals, args.quote_decimals,
+                                  args.depth_max_age_seconds)
     elif args.pool_bin_quote is not None:
         pool_bin_quote = args.pool_bin_quote
     else:
@@ -340,11 +357,12 @@ def main(argv: list[str] | None = None) -> int:
         capital=args.capital, gas_cost=gas_cost, band_pct=args.band_pct,
         perp_cost_bps=args.perp_cost_bps, funding_apr=args.funding_apr,
         pool_bin_quote=pool_bin_quote, in_bin_haircut=args.in_bin_haircut,
+        protocol_fee_pct=args.protocol_fee_pct,
     )
     span_h = (events[-1].ts - events[0].ts) / 3600
     print(f"{len(events)} swaps over {span_h:.1f} h, gas {gas_cost:.5f}/action, "
           f"perp {args.perp_cost_bps:g} bps, funding {args.funding_apr:g} APR, "
-          f"in-bin haircut {args.in_bin_haircut:g}, "
+          f"in-bin haircut {args.in_bin_haircut:g}, protocol share {args.protocol_fee_pct:g}%, "
           f"pool depth {'sampled: ' + args.depth if args.depth else f'{pool_bin_quote:,.0f}/bin'}")
     for r in rows:
         print(_fmt(r))

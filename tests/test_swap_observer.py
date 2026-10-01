@@ -49,6 +49,18 @@ class TestDedupe:
 
 
 class TestFills:
+    @pytest.mark.parametrize("prev,new,label,side", [
+        (100, 102, "down", "sell"), (102, 100, "up", "buy"),
+    ])
+    def test_crossing_follows_bins_when_direction_label_disagrees(
+        self, grid, log, prev, new, label, side,
+    ):
+        ob = SwapObserver(log, grid, "p")
+        ob.register_ladder({101: 1.0}, position_id="PID")
+        ob.on_swap({"tx_signature": "S", "prev_active_bin": prev,
+                    "new_active_bin": new, "direction": label}, ts=2.0)
+        assert [(f["bin_id"], f["side_filled"]) for f in _fills(log)] == [(101, side)]
+
     def test_up_cross_sells_only_crossed_bids(self, grid, log):
         ob = SwapObserver(log, grid, "p")
         ob.set_last_mid(grid.price_from_bin(100), 1.0)

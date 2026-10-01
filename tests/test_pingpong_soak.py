@@ -69,6 +69,19 @@ def test_in_bin_swaps_pay_our_share_of_the_active_bin():
     assert on["lp_total"] - off["lp_total"] == pytest.approx(on["in_bin_fee"])
 
 
+def test_protocol_share_reduces_both_crossing_and_in_bin_fees():
+    events = _walk([0, 2, 0, -2, 0])
+    events.append(BinEvent(ts=400.0, pool="p", active_bin=2, prev_active_bin=2,
+                           direction="up", trade_size_usd=10_000.0, fee_bps=10.0))
+    kw = dict(width=5, shift=3, tau=3600, gas_cost=0.0, pool_bin_quote=9_900.0)
+    gross = pingpong_soak.simulate(events, GRID, **kw)
+    net = pingpong_soak.simulate(events, GRID, protocol_fee_pct=10.0, **kw)
+    assert gross["in_bin_fee"] > 0 and gross["lp_fee"] > gross["in_bin_fee"]
+    assert net["in_bin_fee"] == pytest.approx(0.9 * gross["in_bin_fee"])
+    assert net["lp_fee"] == pytest.approx(0.9 * gross["lp_fee"])
+    assert net["lp_total"] == pytest.approx(gross["lp_total"] - 0.1 * gross["lp_fee"])
+
+
 def test_sampled_depth_uses_latest_sample_for_the_active_bin(tmp_path):
     def row(ts, active, quote_raw):
         # 6-decimal quote only: bin value = quote_raw / 1e6
@@ -79,10 +92,22 @@ def test_sampled_depth_uses_latest_sample_for_the_active_bin(tmp_path):
     path.write_text("\n".join(json.dumps(r) for r in [
         row(100.0, 0, 1_000_000), {"ts": 150.0, "pool": "p", "error": "RpcReadError"},
         row(200.0, 0, 3_000_000)]) + "\n")
-    depth = pingpong_soak.depth_at(str(path), 9, 6)
+    depth = pingpong_soak.depth_at(str(path), 9, 6, max_age_seconds=60)
     at = lambda ts, b: depth(BinEvent(ts=ts, pool="p", active_bin=b, prev_active_bin=b,
                                       direction="down", trade_size_usd=0.0, fee_bps=0.0))
     assert at(150.0, 0) == pytest.approx(2.0)    # latest sample at/before ts (bin 0 = 2 × 1.0)
     assert at(250.0, 1) == pytest.approx(9.0)    # later sample, bin 1 = 3 × 3.0
-    assert at(250.0, 50) == pytest.approx(6.0)   # unsampled bin: the sample's median
-    assert at(10.0, 0) == pytest.approx(2.0)     # before any sample: the first one
+    assert at(250.0, 50) == float("inf")        # unsampled bin: no fee credit
+    assert at(10.0, 0) == float("inf")          # no future sample
+    assert at(270.0, 0) == float("inf")         # stale sample
+    assert depth(BinEvent(ts=250.0, pool="other", active_bin=0, prev_active_bin=0,
+                          direction="down", trade_size_usd=0.0, fee_bps=0.0)) == float("inf")
+
+
+def test_soak_gate_requires_beating_idle_hold(monkeypatch):
+    monkeypatch.setattr(pingpong_soak, "simulate", lambda *a, **kw: {
+        "hedged_total": 1.0, "lp_total": 3.0, "idle_hold": 2.0,
+        "max_dd_hedged": 1.0, "max_dd_lp": 2.0,
+    })
+    (row,) = pingpong_soak.soak(_walk([0, 1, 2]), GRID, [5], [3], [3600], 0.5)
+    assert row["gate_pass"] is False

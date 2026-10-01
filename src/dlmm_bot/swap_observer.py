@@ -92,8 +92,9 @@ class SwapObserver:
 
         prev = int(payload.get("prev_active_bin", 0))
         new = int(payload.get("new_active_bin", 0))
-        direction = payload.get("direction") or (
-            "up" if new > prev else "down"
+        # Bin traversal determines fills; retain the taker direction for flat swaps.
+        direction = ("up" if new > prev else "down") if new != prev else (
+            payload.get("direction") or "down"
         )
         event_ts = float(ts or payload.get("ts")
                          or payload.get("block_time")
