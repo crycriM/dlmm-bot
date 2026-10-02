@@ -7,6 +7,7 @@ from threading import Event
 from unittest.mock import patch
 
 import pytest
+from decimal import Decimal
 
 from dlmm_bot.event_log import ReplayLog
 from dlmm_bot.exec_bridge import ExecResult
@@ -48,7 +49,11 @@ class Bridge:
         side = kwargs["side"]
         pid = self.address(side, kwargs["bin_ids"])
         token, decimals = ("base", 9) if side == "ask" else ("quote", 6)
-        raw = round(sum(kwargs["amounts"]) * 10**decimals)
+        # Mirror the executor: the total must be an exact count of raw units.
+        total = sum(Decimal(str(a)) for a in kwargs["amounts"]) * 10**decimals
+        if total != total.to_integral_value():
+            return ExecResult(ok=False, error="bad_request")
+        raw = int(total)
         self.wallet[token] -= raw
         self.positions[pid] = {
             "position_id": pid, "pool": "pool", "owner": "wallet", "slot": 1,
@@ -139,6 +144,23 @@ def test_existing_pda_fails_before_any_mutation(tmp_path):
     assert bridge.calls == []
     assert report["stop_reason"] == "preflight_failed"
     assert report["cleanup_complete"] is False  # never claim the existing PDA was closed
+
+
+def test_opening_amounts_are_whole_raw_units_at_a_real_price(tmp_path):
+    bridge = Bridge()
+    bridge.active_bin = -5277  # live 2026-10-02: ~121.2 USDC/SOL, $5 of wSOL over 5 bins
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["error"] is None and report["cleanup_complete"] is True
+    assert [c[0] for c in bridge.calls][:2] == ["deposit", "deposit"]
+
+
+def test_underfunded_base_fails_preflight_naming_the_short_side(tmp_path):
+    bridge = Bridge()
+    bridge.wallet["base"] = 0  # e.g. wSOL unwrapped to native SOL
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert bridge.calls == []
+    assert report["stop_reason"] == "preflight_failed"
+    assert "base raw 0 <" in report["error"] and "quote" not in report["error"].split("(")[1]
 
 
 def test_preflight_only_never_calls_a_write_verb(tmp_path):

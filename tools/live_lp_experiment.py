@@ -33,6 +33,15 @@ from live_keeper_write_soak import GATEWAY_ENV_KEYS
 EXECUTOR = Path(__file__).resolve().parents[2] / "solana-clmm-executor"
 
 
+def per_bin(amount: float, decimals: int, width: int) -> list[float]:
+    """Equal per-bin amounts in whole raw token units.
+
+    The executor rejects a deposit whose total is not an exact number of raw
+    units (bad_request); floor like Keeper._quantized_side, never over budget.
+    """
+    return [math.floor(amount * 10**decimals / width) / 10**decimals] * width
+
+
 class OpeningDrift(ValueError):
     """The executor rejected a deposit before signing; a fresh plan is safe."""
 
@@ -210,14 +219,20 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         initial_quote = args.capital / 2
         initial_base = math.floor(initial_quote / mid * 10**grid.base_decimals) / 10**grid.base_decimals
         baseline = data["balances_raw"].copy()
-        if (int(baseline["base"]) < round(initial_base * 10**grid.base_decimals)
-                or int(baseline["quote"]) < round(initial_quote * 10**grid.quote_decimals)):
-            raise ValueError("insufficient pre-funded base/quote; experiment never swaps to fund itself")
+        # Token balances only: base is wSOL in its token account, not native SOL.
+        need = {"base": round(initial_base * 10**grid.base_decimals),
+                "quote": round(initial_quote * 10**grid.quote_decimals)}
+        short = [f"{side} raw {baseline[side]} < {need[side]}"
+                 for side in need if int(baseline[side]) < need[side]]
+        if short:
+            raise ValueError(f"insufficient pre-funded base/quote ({'; '.join(short)}); "
+                             "experiment never swaps to fund itself")
         active = int(data["active_bin"])
         legs = [{"side": side, "bin_ids": list(range(lo, lo + args.width)),
-                 "amounts": [amount / args.width] * args.width}
-                for side, lo, amount in (("bid", active - args.width, initial_quote),
-                                        ("ask", active + 1, initial_base))]
+                 "amounts": per_bin(amount, decimals, args.width)}
+                for side, lo, amount, decimals in (
+                    ("bid", active - args.width, initial_quote, grid.quote_decimals),
+                    ("ask", active + 1, initial_base, grid.base_decimals))]
         inspected = accounts(args, legs)
         proposed = [p["position_id"] for p in inspected["positions"]]
         log.emit("experiment_plan", args=vars(args), legs=legs,
@@ -256,7 +271,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         initial_base = math.floor(initial_quote / mid * 10**grid.base_decimals) / 10**grid.base_decimals
                         if int(baseline["base"]) < round(initial_base * 10**grid.base_decimals):
                             raise ValueError("pre-funded base cannot cover the fresh opening price")
-                        legs[1]["amounts"] = [initial_base / args.width] * args.width
+                        legs[1]["amounts"] = per_bin(initial_base, grid.base_decimals, args.width)
                     lo = active - args.width if leg["side"] == "bid" else active + 1
                     bins = list(range(lo, lo + args.width))
                     if bins != leg["bin_ids"]:
