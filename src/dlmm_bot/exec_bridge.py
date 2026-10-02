@@ -168,6 +168,10 @@ class ExecBridge:
             cwd=self.cwd,
             text=True,
             bufsize=1,
+            # Own session: a terminal Ctrl-C reaches the keeper only, so its
+            # graceful stop still has a live executor to withdraw through. The
+            # child still exits when its stdin closes (keeper gone or stop()).
+            start_new_session=True,
         )
         # The executor logs everything to stderr. If nobody reads it the OS pipe (64 KiB)
         # fills, node blocks on write and the keeper blocks on readline forever.

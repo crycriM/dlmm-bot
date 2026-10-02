@@ -236,6 +236,39 @@ def test_protocol_ambiguous_error_without_transport_flag_stops_all_writes(tmp_pa
     assert bridge.calls == []
 
 
+def ambiguous_bid_withdraw(bridge, lands):
+    real = bridge.withdraw
+    def withdraw(position_id, percent):
+        if position_id != "bid":
+            return real(position_id, percent)
+        if lands:
+            real(position_id, percent)
+        else:
+            bridge.calls.append(("withdraw", position_id, percent))
+        return ExecResult(ok=False, error="submission_ambiguous", fee_lamports=5000 if lands else None,
+                          tx_signatures=["withdraw-bid"], data={"pending_signature": "withdraw-bid"})
+    bridge.withdraw = withdraw
+
+
+def test_ambiguous_cleanup_withdraw_resolved_by_read_closes_the_rest(tmp_path):
+    bridge = Bridge()
+    ambiguous_bid_withdraw(bridge, lands=True)
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["unresolved_outcome"] is False and report["cleanup_complete"] is True
+    assert report["remaining_position_ids"] == [] and report["error"] is None
+    assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]
+    assert ReplayLog(str(tmp_path / "run.jsonl")).by_type("cleanup_resolved")[0]["position_id"] == "bid"
+
+
+def test_ambiguous_cleanup_withdraw_with_position_still_present_stops(tmp_path):
+    bridge = Bridge()
+    ambiguous_bid_withdraw(bridge, lands=False)
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["unresolved_outcome"] is True and report["cleanup_complete"] is False
+    assert report["remaining_position_ids"] == ["bid", "ask"]
+    assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw"]
+
+
 class MovingBridge(Bridge):
     def __init__(self, rejects=1, side="bid", ambiguous=False):
         super().__init__()

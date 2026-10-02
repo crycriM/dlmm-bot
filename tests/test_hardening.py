@@ -65,6 +65,17 @@ class TestExecBridge:
             bridge.stop()
         assert not result.ok and result.unknown_outcome and "mismatch" in result.error
 
+    def test_executor_runs_in_its_own_session(self):
+        # Live 2026-10-02: Ctrl-C killed the executor with the keeper, so the
+        # graceful stop had to cold-restart it mid-cleanup.
+        import os
+        bridge = py_bridge("import sys; sys.stdin.readline()")
+        try:
+            bridge.start()
+            assert os.getsid(bridge._proc.pid) != os.getsid(0)
+        finally:
+            bridge.stop()
+
     def test_stderr_flood_does_not_deadlock(self):
         # 300 KB of stderr before replying: fills the 64 KiB pipe unless it is drained
         script = (

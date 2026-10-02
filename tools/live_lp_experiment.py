@@ -42,6 +42,14 @@ def per_bin(amount: float, decimals: int, width: int) -> list[float]:
     return [math.floor(amount * 10**decimals / width) / 10**decimals] * width
 
 
+class ActionFailed(ValueError):
+    """An executor verb answered ok=false; carries the result for triage."""
+
+    def __init__(self, message: str, result):
+        super().__init__(message)
+        self.result = result
+
+
 class OpeningDrift(ValueError):
     """The executor rejected a deposit before signing; a fresh plan is safe."""
 
@@ -133,6 +141,14 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
             raise ValueError("pool state is stale or from the future")
         return data
 
+    def position_gone(pid) -> bool:
+        try:
+            result = bridge.get_position(pid)
+        except Exception:
+            return False
+        log.emit("position_observation", **(asdict(result) | {"position_id": pid}))
+        return not result.ok and result.error == "unknown_position"
+
     def action(verb, payload, pid):
         nonlocal fees, unknown, signed
         log.emit("action_request", verb=verb, payload=payload, expected_position_id=pid)
@@ -162,7 +178,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                 opened.remove(pid)  # proven pre-submission rejection: never adopt a later foreign position
                 if result.error == "active_bin_slippage_exceeded":
                     raise OpeningDrift("deposit_single_sided failed: active_bin_slippage_exceeded")
-            raise ValueError(f"{verb} failed: {result.error}")
+            raise ActionFailed(f"{verb} failed: {result.error}", result)
         if (result.position_id or (result.data or {}).get("position_id")) != pid:
             unknown = True
             raise ValueError("executor returned an unexpected position address")
@@ -342,8 +358,18 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                     claimed["quote"] += int(claim["y_raw"])
                     opened.remove(pid)
                 except Exception as exc:
+                    log.emit("cleanup_error", position_id=pid, error=str(exc), unresolved_outcome=unknown)
+                    # The executor signed and answered, but could not confirm the close
+                    # (live 2026-10-02: a lagging read). One read settles it: an absent
+                    # account means the close landed. Transport failures stay unresolved.
+                    if (unknown and isinstance(exc, ActionFailed)
+                            and exc.result.error == "submission_ambiguous" and position_gone(pid)):
+                        unknown = False
+                        opened.remove(pid)
+                        log.emit("cleanup_resolved", position_id=pid, evidence="position account absent",
+                                 note="fees_claimed unknown; any claim lands in the principal residual")
+                        continue
                     error = str(exc)
-                    log.emit("cleanup_error", position_id=pid, error=error, unresolved_outcome=unknown)
                     if unknown:
                         break  # do not restart the executor or blindly resubmit
             if not opened and not unknown:
