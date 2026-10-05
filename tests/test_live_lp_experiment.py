@@ -125,6 +125,27 @@ def test_real_run_opens_two_closes_both_and_records_receipt_costs(tmp_path):
     assert log.events()[-1]["event_type"] == "run_stopped"
 
 
+def test_read_timeout_is_preserved_when_cleanup_has_an_external_native_credit(tmp_path):
+    bridge = Bridge()
+    original = bridge.get_state
+    failed = False
+    def get_state(pool):
+        nonlocal failed
+        if len(bridge.positions) == 2 and not failed:
+            failed = True
+            bridge.native += 1  # October 5: unrelated incoming 1-lamport transfer.
+            return ExecResult(ok=False, unknown_outcome=True, error="executor timeout after 120s")
+        return original(pool)
+    bridge.get_state = get_state
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["error"] == "pool state unavailable: executor timeout after 120s"
+    assert report["cleanup_error"] == "native rent/receipt balance does not reconcile"
+    assert report["cleanup_complete"] is False
+    assert report["unresolved_outcome"] is False
+    assert report["remaining_position_ids"] == []
+    assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]
+
+
 def test_ambiguous_deposit_preserves_known_addresses_and_never_retries(tmp_path):
     bridge = Bridge(failure="ask")
     report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))

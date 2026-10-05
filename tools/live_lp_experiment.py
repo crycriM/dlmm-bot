@@ -158,6 +158,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     preflight_pass = False
     cleanup_complete = False
     reason, error = "preflight_failed", None
+    cleanup_error = None
     ranges = {}           # open position -> (lowest bin, highest bin)
     outlay = 0            # lamports the executor's run cap has counted so far
     last_active = None
@@ -168,7 +169,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         result = bridge.get_state(args.pool)
         log.emit("state_observation", ok=result.ok, state=result.data, error=result.error)
         if not result.ok or not result.data:
-            raise ValueError("pool state unavailable")
+            raise ValueError(f"pool state unavailable: {result.error or 'empty response'}")
         data = result.data
         if (data["token_x"]["mint"], data["token_y"]["mint"]) != (args.base_mint, args.quote_mint):
             raise ValueError("pool mint pair mismatch")
@@ -483,7 +484,8 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         log.emit("cleanup_resolved", position_id=pid, evidence="position account absent",
                                  note="fees_claimed unknown; any claim lands in the principal residual")
                         continue
-                    error = str(exc)
+                    cleanup_error = str(exc)
+                    error = error or cleanup_error
                     if unknown:
                         break  # do not restart the executor or blindly resubmit
             if not opened and not unknown:
@@ -500,13 +502,15 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         raise ValueError("native rent/receipt balance does not reconcile")
                     cleanup_complete = True
                 except Exception as exc:
-                    error = str(exc)
-                    log.emit("cleanup_error", error=error)
+                    cleanup_error = str(exc)
+                    error = error or cleanup_error
+                    log.emit("cleanup_error", error=cleanup_error)
         report = {"preflight_pass": preflight_pass, "live_started": bool(signed or unknown),
                   "n_shifts": n_shifts,
                   "stop_reason": reason, "cleanup_complete": cleanup_complete,
                   "unresolved_outcome": unknown, "remaining_position_ids": opened,
                   "expected_position_ids": proposed, "fee_lamports": fees, "error": error,
+                  "cleanup_error": cleanup_error,
                   "inventory_mark_pnl": targets["lp_inventory_mark"],
                   "idle_hold_pnl": initial_base * (mid - mid0) if deployed else 0.0,
                   "pnl": ledger.explain(mid=mid, include_events=False).to_dict() if mid > 0 else None,
