@@ -154,6 +154,22 @@ def test_opening_amounts_are_whole_raw_units_at_a_real_price(tmp_path):
     assert [c[0] for c in bridge.calls][:2] == ["deposit", "deposit"]
 
 
+@pytest.mark.parametrize("sig", experiment.STOP_SIGNALS)
+def test_every_stop_signal_takes_the_graceful_path(sig):
+    # Live 2026-10-02: a dropped SSH session (SIGHUP) killed the run uncleanly.
+    import signal
+    saved = {s: signal.getsignal(s) for s in experiment.STOP_SIGNALS}
+    stop = Event()
+    try:
+        experiment.install_stop_signals(stop)
+        os.kill(os.getpid(), sig)
+        assert stop.is_set()
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+    assert signal.SIGHUP in experiment.STOP_SIGNALS
+
+
 def test_underfunded_base_fails_preflight_naming_the_short_side(tmp_path):
     bridge = Bridge()
     bridge.wallet["base"] = 0  # e.g. wSOL unwrapped to native SOL
@@ -182,7 +198,7 @@ def test_live_environment_fails_closed(tmp_path, override):
     env = {"SOLANA_RPC_URL": "https://rpc.test", "WALLET_PUBKEY": "wallet",
            "LIVE_WRITE_CONFIRM": "yes", "DRY_RUN": "false",
            "MAX_SOL_PER_TX": "0.23", "MAX_SOL_PER_RUN": "0.25",
-           "MAX_SLIPPAGE_BPS": "25", "MAX_ACTIVE_BIN_SLIPPAGE_BINS": "0",
+           "MAX_SLIPPAGE_BPS": "25", "MAX_ACTIVE_BIN_SLIPPAGE_BINS": "1",
            "MAX_PRIORITY_FEE_LAMPORTS": "10000", "JITO_ENABLED": "false"} | override
     with patch.dict(os.environ, env, clear=True), pytest.raises(ValueError):
         experiment.validate_environment(args(tmp_path))
@@ -270,9 +286,9 @@ def test_ambiguous_cleanup_withdraw_with_position_still_present_stops(tmp_path):
 
 
 class MovingBridge(Bridge):
-    def __init__(self, rejects=1, side="bid", ambiguous=False):
+    def __init__(self, rejects=1, side="bid", ambiguous=False, error="active_bin_slippage_exceeded"):
         super().__init__()
-        self.rejects, self.side, self.ambiguous = rejects, side, ambiguous
+        self.rejects, self.side, self.ambiguous, self.error = rejects, side, ambiguous, error
         self.address = lambda side, bins: f"{side}:{bins[0]}"
 
     def deposit_single_sided(self, **kwargs):
@@ -280,15 +296,16 @@ class MovingBridge(Bridge):
             self.calls.append(("rejected", kwargs))
             self.rejects -= 1
             self.active_bin += 1
-            return ExecResult(ok=False, error="active_bin_slippage_exceeded")
+            return ExecResult(ok=False, error=self.error)
         if self.ambiguous:
             self.calls.append(("ambiguous", kwargs))
             return ExecResult(ok=False, unknown_outcome=True, error="timeout")
         return super().deposit_single_sided(**kwargs)
 
 
-def test_opening_replans_after_unsigned_drift_and_keeps_zero_tolerance(tmp_path):
-    bridge = MovingBridge()
+@pytest.mark.parametrize("error", experiment.DRIFT_ERRORS)
+def test_opening_replans_after_unsigned_drift_and_keeps_its_tolerance(tmp_path, error):
+    bridge = MovingBridge(error=error)
     report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
     assert report["cleanup_complete"] is True
     assert report["error"] is None
@@ -296,7 +313,7 @@ def test_opening_replans_after_unsigned_drift_and_keeps_zero_tolerance(tmp_path)
     assert bridge.calls[0][1]["expected_active_bin"] == 0
     assert bridge.calls[1][1]["expected_active_bin"] == 1
     assert bridge.calls[1][1]["bin_ids"] == [-4, -3, -2, -1, 0]
-    assert all(c[1]["max_active_bin_slippage"] == 0 for c in bridge.calls[:3])
+    assert all(c[1]["max_active_bin_slippage"] == experiment.ACTIVE_BIN_TOLERANCE for c in bridge.calls[:3])
     assert len(ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")) == 1
     assert "bid:-4" in report["expected_position_ids"]
 
@@ -361,3 +378,45 @@ def test_drift_error_with_receipt_evidence_is_never_retried(tmp_path):
     assert report["cleanup_complete"] is False
     assert report["remaining_position_ids"] == ["bid"]
     assert not ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")
+
+
+class TrendBridge(Bridge):
+    """Price jumps up by `step` bins on every read once both legs are open."""
+
+    def __init__(self, step=40):
+        super().__init__()
+        self.step = step
+        self.address = lambda side, bins: f"{side}:{bins[0]}"
+
+    def get_state(self, pool):
+        if len(self.positions) >= 2 or any(c[0] == "withdraw" for c in self.calls):
+            self.active_bin += self.step
+        return super().get_state(pool)
+
+
+def test_shift_moves_everything_one_sided_next_to_the_price_within_the_run_cap(tmp_path):
+    bridge = TrendBridge()
+    a = args(tmp_path)
+    a.shift_gap = 3
+    report = experiment.run_experiment(bridge, a, tmp_path, Event(), account_reader(bridge))
+    assert report["cleanup_complete"] is True and report["error"] is None
+    calls = [(c[0], c[1]["side"] if c[0] == "deposit" else c[1]) for c in bridge.calls]
+    # open both, close both, one bid next to the (higher) price, then its final close
+    assert [c[0] for c in calls][:5] == ["deposit", "deposit", "withdraw", "withdraw", "deposit"]
+    assert calls[4][1] == "bid"
+    log = ReplayLog(str(tmp_path / "run.jsonl"))
+    assert report["n_shifts"] == 1
+    # 0.25 SOL cap with 0.06 SOL test rent: a second shift does not fit
+    assert log.by_type("shift_skipped")
+    shifted = bridge.calls[4][1]
+    assert max(shifted["bin_ids"]) < shifted["expected_active_bin"]
+    # all experiment-owned quote went back in; the fake does not convert the ask's
+    # base on the way up (a real crossed ask would be quote too), so that is $5
+    assert sum(shifted["amounts"]) == pytest.approx(5.0, abs=1e-5)
+
+
+def test_shift_gap_zero_keeps_fixed_ranges(tmp_path):
+    bridge = TrendBridge()
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["n_shifts"] == 0
+    assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]

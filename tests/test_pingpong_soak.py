@@ -45,6 +45,34 @@ def test_trend_accumulates_without_swapping_and_hedge_cuts_drawdown():
 
 
 
+def test_shift_latency_leaves_the_book_empty_until_the_deposit_lands():
+    path = list(range(0, -30, -1))
+    instant = pingpong_soak.simulate(_walk(path), GRID, width=5, shift=2, tau=900, gas_cost=0.0)
+    never = pingpong_soak.simulate(_walk(path), GRID, width=5, shift=2, tau=900, gas_cost=0.0,
+                                   shift_latency_s=1e9)
+    assert instant["n_shifts"] > 1
+    # The first shift's deposit never lands: nothing left to flip or re-shift,
+    # and the accounting check inside simulate() still holds with the wallet.
+    assert never["n_shifts"] == 1 and instant["n_shifts"] > never["n_shifts"]
+    assert never["final_base_share"] == 1.0
+
+
+def test_shift_latency_costs_fees_on_the_events_it_skips():
+    path = [0, 3, 0, -3] * 5 + list(range(0, -20, -1)) + [0, 3, 0, -3] * 5
+    kw = dict(width=5, shift=2, tau=3600, gas_cost=0.0)
+    instant = pingpong_soak.simulate(_walk(path), GRID, **kw)
+    lagged = pingpong_soak.simulate(_walk(path), GRID, shift_latency_s=300.0, **kw)
+    assert instant["n_shifts"] > 0 and lagged["n_shifts"] > 0
+    assert lagged["lp_fee"] < instant["lp_fee"]
+    assert lagged["time_in_range"] < instant["time_in_range"]
+
+
+def test_negative_shift_latency_is_rejected():
+    with pytest.raises(ValueError):
+        pingpong_soak.simulate(_walk([0, 1, 2]), GRID, width=5, shift=2, tau=900,
+                               shift_latency_s=-1.0)
+
+
 def test_one_bin_gap_does_not_reshift():
     # At 6 the untouched bids merge into 1..5 next to the active bin (one
     # real shift). Swaps that keep price at 6 find the range already there;

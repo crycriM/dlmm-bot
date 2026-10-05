@@ -11,8 +11,8 @@ set +a
 # Freeze the envelope; no inherited wider allow-list or relaxed policy cap.
 export WALLET_PUBKEY=EHok6xvSGk1tTKabn7z4s4VJyuevQ4UPUymskStU7VvS
 export SOLANA_RPC_MAX_CU_PER_SECOND=40 SOLANA_COMMITMENT=finalized
-export MAX_SOL_PER_TX=0.23 MAX_SOL_PER_RUN=0.25 MAX_SLIPPAGE_BPS=25
-export MAX_ACTIVE_BIN_SLIPPAGE_BINS=0 MAX_PRIORITY_FEE_LAMPORTS=10000
+export MAX_SOL_PER_TX=0.23 MAX_SOL_PER_RUN=0.5 MAX_SLIPPAGE_BPS=25
+export MAX_ACTIVE_BIN_SLIPPAGE_BINS=1 MAX_PRIORITY_FEE_LAMPORTS=10000
 export JITO_ENABLED=false JITO_TIP_LAMPORTS=0
 unset DEPTH_SAMPLE_PATH DEPTH_SAMPLE_INTERVAL_S
 EXTRA=()
@@ -33,5 +33,5 @@ exec flock -n "$DLMM_ROOT/logs/live-experiment-wallet.lock" \
   --quote-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
   --wallet "$WALLET_PUBKEY" --capital "${EXPERIMENT_CAPITAL:-10}" \
   --loss-limit "${EXPERIMENT_LOSS_LIMIT:-1}" --fee-budget-sol 0.01 \
-  --duration-seconds 7200 --width 5 --refresh-interval 30 \
+  --duration-seconds 7200 --width 20 --shift-gap ${EXPERIMENT_SHIFT_GAP:-30} --refresh-interval 30 \
   --out "$RUN_DIR" "${EXTRA[@]}"

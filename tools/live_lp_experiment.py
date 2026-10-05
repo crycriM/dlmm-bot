@@ -33,6 +33,20 @@ from live_keeper_write_soak import GATEWAY_ENV_KEYS
 EXECUTOR = Path(__file__).resolve().parents[2] / "solana-clmm-executor"
 
 
+# Bins the active bin may move between plan and execution. Zero rejected 2 of 3
+# bid attempts in a fast hour (2026-10-02); one bin (4 bps here) only lets a
+# move *away* from the range through, a move into it is still bins_cross_active.
+ACTIVE_BIN_TOLERANCE = 1
+# What the executor's run cap (MAX_SOL_PER_RUN) counts per verb, mirrored so a
+# shift is skipped rather than rejected: deposit = new position rent + one
+# token-account allowance + signature; withdraw = two allowances + signature.
+TOKEN_ACCOUNT_LAMPORTS = 2_039_280
+SIGNATURE_LAMPORTS = 5_000
+WITHDRAW_CHARGE = 2 * TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS
+# Unsigned, deterministic rejections caused by the price moving: re-plan.
+DRIFT_ERRORS = ("active_bin_slippage_exceeded", "bins_cross_active")
+
+
 def per_bin(amount: float, decimals: int, width: int) -> list[float]:
     """Equal per-bin amounts in whole raw token units.
 
@@ -40,6 +54,17 @@ def per_bin(amount: float, decimals: int, width: int) -> list[float]:
     units (bad_request); floor like Keeper._quantized_side, never over budget.
     """
     return [math.floor(amount * 10**decimals / width) / 10**decimals] * width
+
+
+# SIGHUP is what a dropped SSH session sends. Default action kills Python with no
+# cleanup (live 2026-10-02: both positions left open for 3 h 20 min), so it must
+# take the same graceful path as Ctrl-C: withdraw everything this run opened.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+def install_stop_signals(stop) -> None:
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, lambda *_: stop.set())
 
 
 class ActionFailed(ValueError):
@@ -66,6 +91,9 @@ def build_args(argv=None):
     p.add_argument("--duration-seconds", type=float, default=7200)
     p.add_argument("--refresh-interval", type=float, default=30)
     p.add_argument("--width", type=int, default=5)
+    p.add_argument("--shift-gap", type=int, default=0,
+                   help="bins past both ranges before all liquidity moves one-sided next to "
+                        "the price (fees compound into it); 0 = fixed ranges")
     p.add_argument("--live", action="store_true")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
@@ -75,6 +103,8 @@ def build_args(argv=None):
         value = getattr(args, name)
         if not math.isfinite(value) or not 0 < value <= maximum:
             p.error(f"{name} must be finite and in (0, {maximum}]")
+    if not 0 <= args.shift_gap <= 200:
+        p.error("shift_gap must be in [0, 200]")
     return args
 
 
@@ -88,13 +118,13 @@ def validate_environment(args):
         return
     if os.environ.get("LIVE_WRITE_CONFIRM") != "yes" or os.environ.get("DRY_RUN") != "false":
         raise ValueError("--live requires LIVE_WRITE_CONFIRM=yes and DRY_RUN=false")
-    for key, maximum in (("MAX_SOL_PER_TX", .23), ("MAX_SOL_PER_RUN", .25),
+    for key, maximum in (("MAX_SOL_PER_TX", .23), ("MAX_SOL_PER_RUN", .5),
                          ("MAX_SLIPPAGE_BPS", 25), ("MAX_PRIORITY_FEE_LAMPORTS", 10000)):
         value = float(os.environ.get(key, "nan"))
         if not math.isfinite(value) or not 0 <= value <= maximum:
             raise ValueError(f"{key} must be finite and <= {maximum}")
-    if os.environ.get("MAX_ACTIVE_BIN_SLIPPAGE_BINS") != "0":
-        raise ValueError("experiment requires zero active-bin slippage")
+    if os.environ.get("MAX_ACTIVE_BIN_SLIPPAGE_BINS") != str(ACTIVE_BIN_TOLERANCE):
+        raise ValueError(f"experiment requires active-bin slippage cap {ACTIVE_BIN_TOLERANCE}")
     if os.environ.get("JITO_ENABLED", "false") != "false":
         raise ValueError("experiment requires JITO_ENABLED=false")
 
@@ -128,6 +158,11 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     preflight_pass = False
     cleanup_complete = False
     reason, error = "preflight_failed", None
+    ranges = {}           # open position -> (lowest bin, highest bin)
+    outlay = 0            # lamports the executor's run cap has counted so far
+    last_active = None
+    n_shifts = 0
+    shift_skip_logged = False
 
     def state():
         result = bridge.get_state(args.pool)
@@ -150,7 +185,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         return not result.ok and result.error == "unknown_position"
 
     def action(verb, payload, pid):
-        nonlocal fees, unknown, signed
+        nonlocal fees, unknown, signed, outlay
         log.emit("action_request", verb=verb, payload=payload, expected_position_id=pid)
         # Persist deterministic recovery handles before the signer sees a request.
         with open(log.path, "rb") as durable:
@@ -176,20 +211,23 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         if not result.ok:
             if verb == "deposit_single_sided" and not unknown:
                 opened.remove(pid)  # proven pre-submission rejection: never adopt a later foreign position
-                if result.error == "active_bin_slippage_exceeded":
-                    raise OpeningDrift("deposit_single_sided failed: active_bin_slippage_exceeded")
+                if result.error in DRIFT_ERRORS:
+                    raise OpeningDrift(f"deposit_single_sided failed: {result.error}")
             raise ActionFailed(f"{verb} failed: {result.error}", result)
         if (result.position_id or (result.data or {}).get("position_id")) != pid:
             unknown = True
             raise ValueError("executor returned an unexpected position address")
         if not result.tx_signatures or result.total_fee_lamports is None:
             raise ValueError("confirmed action has incomplete receipt evidence")
+        if verb == "withdraw":
+            outlay += WITHDRAW_CHARGE
         return result
 
     def snapshot():
-        nonlocal mid
+        nonlocal mid, last_active
         data = state()
-        mid = grid.price_from_bin(int(data["active_bin"]))
+        last_active = int(data["active_bin"])
+        mid = grid.price_from_bin(last_active)
         raw = {k: int(data["balances_raw"][k]) - int(baseline[k]) for k in claimed}
         pending = {"base": 0, "quote": 0}
         for pid in opened:
@@ -226,6 +264,78 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                  idle_hold_pnl=initial_base * (mid - mid0), pnl=pnl,
                  accounting="shared PnLLedger custody marks, not fill-level attribution")
         return pnl
+
+    def close(pid):
+        """Withdraw 100 % of one verified position this run opened."""
+        before = bridge.get_position(pid)
+        log.emit("position_observation", **(asdict(before) | {"position_id": pid}))
+        if not before.ok and before.error == "unknown_position":
+            opened.remove(pid)  # rejected deposit; exact preflight PDA remains absent
+            ranges.pop(pid, None)
+            return
+        if not before.ok or not before.data or (before.data.get("owner"), before.data.get("pool")) != (args.wallet, args.pool):
+            raise ValueError("cleanup cannot verify owned position")
+        result = action("withdraw", {"position_id": pid, "percent": 100}, pid)
+        if not (result.data or {}).get("closed"):
+            raise ValueError("withdrawal did not confirm closure")
+        claim = result.data["fees_claimed"]
+        claimed["base"] += int(claim["x_raw"])
+        claimed["quote"] += int(claim["y_raw"])
+        opened.remove(pid)
+        ranges.pop(pid, None)
+
+    def shift():
+        """Move everything one-sided next to the price; claimed fees compound into it.
+
+        Every range is past the price by then, so it is all one token: no swap.
+        """
+        nonlocal n_shifts, outlay
+        side = "bid" if last_active > max(hi for _, hi in ranges.values()) else "ask"
+        log.emit("shift_started", side=side, active_bin=last_active, ranges=ranges)
+        for pid in list(opened):
+            close(pid)
+        token, decimals = (("quote", grid.quote_decimals) if side == "bid"
+                           else ("base", grid.base_decimals))
+        initial_raw = round((initial_quote if side == "bid" else initial_base) * 10**decimals)
+        # ponytail: mirrors the opening loop (proven live) rather than refactoring it.
+        for attempt in range(1, 4):
+            fresh = state()
+            active = int(fresh["active_bin"])
+            # Experiment-owned holdings only: principal plus claimed fees of this token.
+            owned = int(fresh["balances_raw"][token]) - int(baseline[token]) + initial_raw
+            if owned <= 0:
+                raise ValueError("shift found no experiment-owned balance to redeposit")
+            lo = active - args.width if side == "bid" else active + 1
+            leg = {"side": side, "bin_ids": list(range(lo, lo + args.width)),
+                   "amounts": per_bin(owned / 10**decimals, decimals, args.width)}
+            candidate = accounts(args, [leg])
+            log.emit("opening_plan", attempt=attempt, expected_active_bin=active, leg=leg,
+                     shift=n_shifts + 1, **candidate)
+            positions = candidate["positions"]
+            if len(positions) != 1 or positions[0]["side"] != side or positions[0]["exists"]:
+                raise ValueError("shift deposit PDA already exists or account preflight is incomplete")
+            if candidate["native_lamports"] / 1e9 < candidate["rent_lamports"] / 1e9 + args.fee_budget_sol:
+                raise ValueError("shift deposit cannot retain rent and closing fee reserve")
+            pid = positions[0]["position_id"]
+            checked_legs.append(dict(leg))
+            if pid not in proposed:
+                proposed.append(pid)
+            opened.append(pid)
+            try:
+                action("deposit_single_sided", dict(pool=args.pool, **leg, expected_active_bin=active,
+                       max_active_bin_slippage=ACTIVE_BIN_TOLERANCE), pid)
+            except OpeningDrift:
+                log.emit("opening_retry", side=side, attempt=attempt, position_id=pid,
+                         reason="unsigned active-bin rejection")
+                if attempt == 3:
+                    raise
+                continue
+            outlay += candidate["rent_lamports"] + TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS
+            ranges[pid] = (leg["bin_ids"][0], leg["bin_ids"][-1])
+            n_shifts += 1
+            log.emit("shift_done", shift=n_shifts, side=side, position_id=pid, bins=ranges[pid],
+                     amount_raw=owned)
+            return
 
     try:
         data = state()
@@ -309,8 +419,11 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                     opened.append(pid)
                     try:
                         action("deposit_single_sided", dict(pool=args.pool, **leg,
-                               expected_active_bin=active, max_active_bin_slippage=0), pid)
+                               expected_active_bin=active, max_active_bin_slippage=ACTIVE_BIN_TOLERANCE), pid)
                         deployed = True
+                        ranges[pid] = (leg["bin_ids"][0], leg["bin_ids"][-1])
+                        outlay += (inspected["rent_lamports"] // 2 + TOKEN_ACCOUNT_LAMPORTS
+                                   + SIGNATURE_LAMPORTS)
                         break
                     except OpeningDrift:
                         log.emit("opening_retry", side=leg["side"], attempt=attempt,
@@ -329,6 +442,20 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                 if stop.is_set():
                     reason = "signal"
                     break
+                if args.shift_gap and ranges:
+                    lo = min(r[0] for r in ranges.values())
+                    hi = max(r[1] for r in ranges.values())
+                    if max(lo - last_active, last_active - hi, 0) >= args.shift_gap:
+                        # Closes now, the new deposit, and its own final close.
+                        need = (len(opened) + 1) * WITHDRAW_CHARGE + (
+                            inspected["rent_lamports"] // 2 + TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS)
+                        if outlay + need <= float(os.environ["MAX_SOL_PER_RUN"]) * 1e9:
+                            shift()
+                            continue
+                        if not shift_skip_logged:
+                            log.emit("shift_skipped", reason="MAX_SOL_PER_RUN would be exceeded",
+                                     outlay_lamports=outlay, need_lamports=need)
+                            shift_skip_logged = True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -343,20 +470,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         if args.live and preflight_pass and not unknown:
             for pid in list(opened):
                 try:
-                    before = bridge.get_position(pid)
-                    log.emit("position_observation", **(asdict(before) | {"position_id": pid}))
-                    if not before.ok and before.error == "unknown_position":
-                        opened.remove(pid)  # rejected deposit; exact preflight PDA remains absent
-                        continue
-                    if not before.ok or not before.data or (before.data.get("owner"), before.data.get("pool")) != (args.wallet, args.pool):
-                        raise ValueError("cleanup cannot verify owned position")
-                    result = action("withdraw", {"position_id": pid, "percent": 100}, pid)
-                    if not (result.data or {}).get("closed"):
-                        raise ValueError("withdrawal did not confirm closure")
-                    claim = result.data["fees_claimed"]
-                    claimed["base"] += int(claim["x_raw"])
-                    claimed["quote"] += int(claim["y_raw"])
-                    opened.remove(pid)
+                    close(pid)
                 except Exception as exc:
                     log.emit("cleanup_error", position_id=pid, error=str(exc), unresolved_outcome=unknown)
                     # The executor signed and answered, but could not confirm the close
@@ -389,6 +503,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                     error = str(exc)
                     log.emit("cleanup_error", error=error)
         report = {"preflight_pass": preflight_pass, "live_started": bool(signed or unknown),
+                  "n_shifts": n_shifts,
                   "stop_reason": reason, "cleanup_complete": cleanup_complete,
                   "unresolved_outcome": unknown, "remaining_position_ids": opened,
                   "expected_position_ids": proposed, "fee_lamports": fees, "error": error,
@@ -416,15 +531,17 @@ def main(argv=None):
                        "SWAP_STREAM_PATH": str(run_dir / "swaps.jsonl"),
                        "EXECUTOR_LOG_DIR": str(run_dir / "executor")})
     stop = Event()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: stop.set())
+    install_stop_signals(stop)
     bridge = ExecBridge(["node", "dist/bridge.js"], cwd=str(EXECUTOR), timeout=120)
     try:
         report = run_experiment(bridge, args, run_dir, stop)
     finally:
         close_bridge(bridge)
     (run_dir / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"run_dir": str(run_dir), **report}, indent=2))
+    try:
+        print(json.dumps({"run_dir": str(run_dir), **report}, indent=2))
+    except OSError:
+        pass  # terminal already gone (SIGHUP); summary.json above is the record
     return 0 if report["preflight_pass"] and report["cleanup_complete"] and not report["error"] else 1
 
 

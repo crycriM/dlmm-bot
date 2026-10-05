@@ -47,6 +47,7 @@ def simulate(
     pool_bin_quote: float | Callable[[BinEvent], float] = 0.0,
     in_bin_haircut: float = 1.0,
     protocol_fee_pct: float = 0.0,
+    shift_latency_s: float = 0.0,
 ) -> dict:
     """One run: the LP leg alone, the perp hedge, and their sum.
 
@@ -57,9 +58,18 @@ def simulate(
     `in_bin_haircut` scales only that in-bin credit. The pro-rata share has
     no queue priority, no time in book and no self-trade effect, so it is an
     upper bound; a haircut re-checks the gate under a lower fill assumption.
+
+    `shift_latency_s` is the real cost of a shift: the withdraw is decided at
+    the event's time, but the deposit lands that many seconds later, next to
+    the active bin as it stood then. In between the book is empty, so no bin
+    flips and no in-bin fees. Measured: about 13-25 s with confirmed deposits,
+    35-60 s with everything finalized (see the research note, section 3c).
+    0 reproduces the instantaneous shift.
     """
     if not 0 <= protocol_fee_pct <= 100:
         raise ValueError("protocol_fee_pct must be between 0 and 100")
+    if shift_latency_s < 0:
+        raise ValueError("shift_latency_s must be non-negative")
     lp_fee_share = 1.0 - protocol_fee_pct / 100
     lp, perp = PnLLedger("meteora", "pingpong"), PnLLedger("hl", "hedge")
     first = events[0]
@@ -109,6 +119,7 @@ def simulate(
     deploy(first.ts, first.prev_active_bin)
 
     last_ts = first.ts
+    redeploy_at: float | None = None  # a shift's deposit still in flight
     peak_lp = peak_all = dd_lp = dd_all = 0.0
     for e in events:
         dt, last_ts = e.ts - last_ts, e.ts
@@ -116,6 +127,10 @@ def simulate(
         # ponytail: perp priced at the pool mid, no basis; constant funding rate.
         perp.on_funding(e.ts, funding_apr / YEAR_S, mid, dt)
         prev_mid, mid = mid, grid.price_from_bin(e.active_bin)
+        if redeploy_at is not None and e.ts >= redeploy_at:
+            # Lands next to the active bin as it stood before this event.
+            deploy(redeploy_at, e.prev_active_bin)
+            redeploy_at = None
 
         # Backtester crossing rule; a crossed bin flips in place at its price.
         up = e.active_bin > e.prev_active_bin
@@ -150,18 +165,22 @@ def simulate(
             in_bin_fees += fee
             lp.on_cash_flow("lp_fee", e.ts, fee, label="in_bin_fee")
 
-        lo, hi = min(bins), max(bins)
-        gap = max(lo - e.active_bin, e.active_bin - hi, 0)
-        in_range += gap == 0
-        # Out of range: all one token; move it next to the active bin, don't
-        # swap it. A 1-bin gap already sits there (the bins flipped in place),
-        # so re-depositing the same range would only pay gas.
-        a = e.active_bin
-        target = (a + 1, a + width) if lo > a else (a - width, a - 1)
-        if gap >= shift and (lo, hi) != target:
-            withdraw(e.ts)
-            deploy(e.ts, a)
-            n_shifts += 1
+        if bins:  # empty only while a shift's deposit is in flight
+            lo, hi = min(bins), max(bins)
+            gap = max(lo - e.active_bin, e.active_bin - hi, 0)
+            in_range += gap == 0
+            # Out of range: all one token; move it next to the active bin, don't
+            # swap it. A 1-bin gap already sits there (the bins flipped in place),
+            # so re-depositing the same range would only pay gas.
+            a = e.active_bin
+            target = (a + 1, a + width) if lo > a else (a - width, a - 1)
+            if gap >= shift and (lo, hi) != target:
+                withdraw(e.ts)
+                n_shifts += 1
+                if shift_latency_s > 0:
+                    redeploy_at = e.ts + shift_latency_s
+                else:
+                    deploy(e.ts, a)
 
         gap_short = hedge.state.ma_target - short
         if abs(gap_short) * mid > capital * band_pct / 100:
@@ -186,7 +205,7 @@ def simulate(
         raise RuntimeError(f"ledger {lpx.total_pnl} != holdings {physical}: accounting broken")
     hold = capital / 2 / mid0 * (mid - mid0)
     return {
-        "width": width, "shift": shift, "tau": tau,
+        "width": width, "shift": shift, "tau": tau, "shift_latency_s": shift_latency_s,
         "n_events": len(events), "n_flips": n_flips, "n_shifts": n_shifts,
         "n_hedges": n_hedges, "time_in_range": in_range / len(events),
         "lp_fee": lpx.lp_fee_income, "in_bin_fee": in_bin_fees, "gas": lpx.rebalance_cost,
@@ -313,6 +332,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--split", type=float, default=0.5, help="also run each half; 0 = off")
     ap.add_argument("--window-hours", type=float, default=0.0,
                     help="keep only the last N hours of the capture; 0 = whole capture")
+    ap.add_argument("--shift-latency-s", type=float, default=0.0,
+                    help="seconds a shift's deposit lags its withdraw (book empty meanwhile); "
+                         "measured 13-25 s confirmed, 35-60 s finalized")
     ap.add_argument("--in-bin-haircut", type=float, default=1.0,
                     help="fraction of the modeled in-bin fee credit to book (0-1); "
                          "the pro-rata share is an upper bound, so re-gate below 1")
@@ -357,12 +379,13 @@ def main(argv: list[str] | None = None) -> int:
         capital=args.capital, gas_cost=gas_cost, band_pct=args.band_pct,
         perp_cost_bps=args.perp_cost_bps, funding_apr=args.funding_apr,
         pool_bin_quote=pool_bin_quote, in_bin_haircut=args.in_bin_haircut,
-        protocol_fee_pct=args.protocol_fee_pct,
+        protocol_fee_pct=args.protocol_fee_pct, shift_latency_s=args.shift_latency_s,
     )
     span_h = (events[-1].ts - events[0].ts) / 3600
     print(f"{len(events)} swaps over {span_h:.1f} h, gas {gas_cost:.5f}/action, "
           f"perp {args.perp_cost_bps:g} bps, funding {args.funding_apr:g} APR, "
           f"in-bin haircut {args.in_bin_haircut:g}, protocol share {args.protocol_fee_pct:g}%, "
+          f"shift latency {args.shift_latency_s:g}s, "
           f"pool depth {'sampled: ' + args.depth if args.depth else f'{pool_bin_quote:,.0f}/bin'}")
     for r in rows:
         print(_fmt(r))
