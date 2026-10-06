@@ -93,6 +93,7 @@ def args(tmp_path):
 
 def accounts(_, legs):
     return {"native_lamports": 1_000_000_000, "rent_lamports": 60_000_000 * len(legs),
+            "existing_position_ids": [],
             "positions": [{"side": leg["side"], "position_id": leg["side"], "exists": False}
                           for leg in legs]}
 
@@ -109,6 +110,18 @@ def account_reader(bridge):
 @pytest.fixture(autouse=True)
 def cap(monkeypatch):
     monkeypatch.setenv("MAX_SOL_PER_RUN", "0.25")
+    monkeypatch.setattr(experiment, "inspect_stream", lambda pool: None)
+
+
+def test_stream_preflight_rejects_before_signing(tmp_path, monkeypatch):
+    bridge = Bridge()
+    def reject(pool):
+        raise ValueError("swap stream preflight failed")
+    monkeypatch.setattr(experiment, "inspect_stream", reject)
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["preflight_pass"] is False
+    assert report["live_started"] is False
+    assert bridge.calls == []
 
 
 def test_real_run_opens_two_closes_both_and_records_receipt_costs(tmp_path):
@@ -165,6 +178,16 @@ def test_existing_pda_fails_before_any_mutation(tmp_path):
     assert bridge.calls == []
     assert report["stop_reason"] == "preflight_failed"
     assert report["cleanup_complete"] is False  # never claim the existing PDA was closed
+
+
+def test_previous_run_position_blocks_new_ladder_before_any_mutation(tmp_path):
+    bridge = Bridge()
+    def stale_position(*a):
+        return accounts(*a) | {"existing_position_ids": ["previous-run-position"]}
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), stale_position)
+    assert bridge.calls == []
+    assert report["preflight_pass"] is False
+    assert "already has 1 position" in report["error"]
 
 
 def test_opening_amounts_are_whole_raw_units_at_a_real_price(tmp_path):
@@ -399,6 +422,44 @@ def test_drift_error_with_receipt_evidence_is_never_retried(tmp_path):
     assert report["cleanup_complete"] is False
     assert report["remaining_position_ids"] == ["bid"]
     assert not ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")
+
+
+def test_confirmed_failed_bin_drift_counts_fee_and_replans(tmp_path):
+    class FailedBinBridge(MovingBridge):
+        def deposit_single_sided(self, **kwargs):
+            if kwargs["side"] == "bid" and self.rejects:
+                self.calls.append(("failed_on_chain", kwargs))
+                self.rejects -= 1
+                self.active_bin += 1
+                self.native -= 5000
+                return ExecResult(
+                    ok=False, error="transaction_failed",
+                    data={"chain_error": {"InstructionError": [2, {"Custom": 6004}]}},
+                    tx_signatures=["failed-bid"],
+                    tx_receipts=[{"signature": "failed-bid", "slot": 42,
+                                  "fee_lamports": 5000, "status": "failed"}],
+                )
+            return super().deposit_single_sided(**kwargs)
+
+    bridge = FailedBinBridge()
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert [c[0] for c in bridge.calls] == ["failed_on_chain", "deposit", "deposit", "withdraw", "withdraw"]
+    assert report["unresolved_outcome"] is False
+    assert report["cleanup_complete"] is True
+    assert report["fee_lamports"] == 25000
+    assert len(ReplayLog(str(tmp_path / "run.jsonl")).by_type("opening_retry")) == 1
+
+
+def test_failed_receipt_without_proof_remains_unresolved(tmp_path):
+    bridge = Bridge()
+    bridge.deposit_single_sided = lambda **_: ExecResult(
+        ok=False, error="transaction_failed", tx_signatures=["maybe-failed"],
+        tx_receipts=[{"signature": "maybe-failed", "slot": None,
+                      "fee_lamports": None, "status": "failed"}],
+    )
+    report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
+    assert report["unresolved_outcome"] is True
+    assert report["remaining_position_ids"] == ["bid"]
 
 
 class TrendBridge(Bridge):

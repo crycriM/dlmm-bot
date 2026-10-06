@@ -141,6 +141,15 @@ def inspect_accounts(args, legs):
     return json.loads(result.stdout)
 
 
+def inspect_stream(pool):
+    result = subprocess.run(
+        ["node", "tools/live-stream-preflight.mjs", pool], cwd=EXECUTOR,
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "swap stream preflight failed")
+
+
 def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     ledger = PnLLedger("meteora", "SOL/USDC-live-experiment")
     log = EventLog(str(run_dir / "run.jsonl"), config_hash=hashlib.sha256(
@@ -201,18 +210,28 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         unsubmitted = {"policy_rejected", "active_bin_slippage_exceeded", "bins_cross_active",
                        "insufficient_balance", "bad_request", "slippage_exceeded",
                        "simulation_failed", "unknown_position"}
+        known_failed = (result.error == "transaction_failed" and bool(result.tx_receipts)
+                        and all(r.get("status") == "failed" and r.get("slot") is not None
+                                and r.get("fee_lamports") is not None
+                                for r in result.tx_receipts))
         unknown = bool(unknown or result.unknown_outcome or (not result.ok and (
-            result.error not in unsubmitted or result.tx_signatures or result.tx_receipts
+            not known_failed and (result.error not in unsubmitted
+            or result.tx_signatures or result.tx_receipts
             or result.total_fee_lamports is not None
-            or (result.data or {}).get("pending_signature"))))
+            or (result.data or {}).get("pending_signature")))))
         if result.total_fee_lamports is not None:
             fees += result.total_fee_lamports
             ledger.on_cash_flow("rebalance", time.time(),
                                 -result.total_fee_lamports / 1e9 * mid, label=verb)
         if not result.ok:
             if verb == "deposit_single_sided" and not unknown:
-                opened.remove(pid)  # proven pre-submission rejection: never adopt a later foreign position
-                if result.error in DRIFT_ERRORS:
+                opened.remove(pid)  # proven rejection or failed receipt: no position was created
+                chain_error = (result.data or {}).get("chain_error")
+                instruction_error = (chain_error or {}).get("InstructionError") if isinstance(chain_error, dict) else None
+                bin_drift = (known_failed and isinstance(instruction_error, list)
+                             and len(instruction_error) == 2
+                             and instruction_error[1] == {"Custom": 6004})
+                if result.error in DRIFT_ERRORS or bin_drift:
                     raise OpeningDrift(f"deposit_single_sided failed: {result.error}")
             raise ActionFailed(f"{verb} failed: {result.error}", result)
         if (result.position_id or (result.data or {}).get("position_id")) != pid:
@@ -327,7 +346,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                        max_active_bin_slippage=ACTIVE_BIN_TOLERANCE), pid)
             except OpeningDrift:
                 log.emit("opening_retry", side=side, attempt=attempt, position_id=pid,
-                         reason="unsigned active-bin rejection")
+                         reason="confirmed or unsigned active-bin rejection")
                 if attempt == 3:
                     raise
                 continue
@@ -365,6 +384,12 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         log.emit("experiment_plan", args=vars(args), legs=legs,
                  caps={k: os.environ[k] for k in GATEWAY_ENV_KEYS
                        if k.startswith("MAX_") and k in os.environ}, **inspected)
+        existing = inspected.get("existing_position_ids")
+        if not isinstance(existing, list) or any(not isinstance(pid, str) for pid in existing):
+            raise ValueError("owned position inventory preflight is incomplete")
+        if existing:
+            raise ValueError(f"wallet already has {len(existing)} position(s) in this pool; "
+                             "recover them before a new experiment")
         if (len(proposed) != 2 or len(set(proposed)) != 2
                 or [p["side"] for p in inspected["positions"]] != [l["side"] for l in legs]
                 or any(p["exists"] for p in inspected["positions"])):
@@ -375,6 +400,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
             raise ValueError("native SOL cannot cover temporary rent plus fee reserve")
         if args.live and rent_sol + args.fee_budget_sol > float(os.environ["MAX_SOL_PER_RUN"]):
             raise ValueError("run cap cannot fund both opening and closing")
+        inspect_stream(args.pool)
         preflight_pass = True
         if not args.live:
             reason, cleanup_complete = "preflight_only", True
@@ -428,7 +454,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                         break
                     except OpeningDrift:
                         log.emit("opening_retry", side=leg["side"], attempt=attempt,
-                                 position_id=pid, reason="unsigned active-bin rejection")
+                                 position_id=pid, reason="confirmed or unsigned active-bin rejection")
                         if attempt == 3:
                             raise
             reason = "duration_elapsed"

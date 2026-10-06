@@ -98,6 +98,7 @@ class ExecResult:
                 "compute_unit_price": receipt.get(
                     "compute_unit_price", receipt.get("computeUnitPrice")
                 ),
+                "status": receipt.get("status"),
             })
         if not receipts and signatures:
             for index, signature in enumerate(signatures):

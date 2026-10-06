@@ -18,6 +18,14 @@ class TestExecResult:
         assert not r.ok
         assert r.error == "executor failed"
 
+    def test_failed_receipt_preserves_status_and_fee(self):
+        r = ExecResult.from_payload({"ok": False, "error": "transaction_failed",
+                                     "tx_signatures": ["sig"], "transactions": [
+                                         {"signature": "sig", "slot": 42,
+                                          "fee_lamports": 5000, "status": "failed"}]})
+        assert r.tx_receipts[0]["status"] == "failed"
+        assert r.total_fee_lamports == 5000
+
 
 class TestFakeExecBridge:
     def setup_method(self):
