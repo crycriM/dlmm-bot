@@ -83,11 +83,11 @@ class Bridge:
                               "x_raw": pos["claimable_fee_x_raw"], "y_raw": pos["claimable_fee_y_raw"]}})
 
 
-def args(tmp_path):
+def args(tmp_path, *extra):
     return experiment.build_args([
         "--pool", "pool", "--base-mint", "base", "--quote-mint", "quote",
         "--wallet", "wallet", "--out", str(tmp_path), "--live",
-        "--duration-seconds", "0.05", "--refresh-interval", "0.001",
+        "--duration-seconds", "0.05", "--refresh-interval", "0.001", *extra,
     ])
 
 
@@ -501,4 +501,73 @@ def test_shift_gap_zero_keeps_fixed_ranges(tmp_path):
     bridge = TrendBridge()
     report = experiment.run_experiment(bridge, args(tmp_path), tmp_path, Event(), account_reader(bridge))
     assert report["n_shifts"] == 0
+    assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]
+
+
+def test_two_bin_exit_and_cooldown_boundaries():
+    ranges = {"bid": (-5, -1), "ask": (1, 5)}
+    assert experiment.shift_status(-6, ranges, 0, 1800, 1800) == (1, 0)
+    assert experiment.shift_status(-7, ranges, 0, 1799, 1800) == (2, 1)
+    assert experiment.shift_status(-7, ranges, 0, 1800, 1800) == (2, 0)
+    assert experiment.shift_status(-8, {"ask": (-6, -2)}, 1800, 3599, 1800) == (2, 1)
+
+
+def test_live_shift_cooldown_starts_at_opening_and_resets_after_shift(tmp_path, monkeypatch):
+    class ExitingBridge(Bridge):
+        def get_state(self, pool):
+            if len(self.positions) == 2 and self.active_bin == 0:
+                self.active_bin = 7  # two bins above the opening ask range
+            return super().get_state(pool)
+
+    bridge = ExitingBridge()
+    clock = [0.0]
+
+    class AdvancingStop:
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            clock[0] += seconds
+            if clock[0] >= 1830:
+                bridge.active_bin = 8  # two bins above the first shifted range
+
+    monkeypatch.setattr(experiment.time, "monotonic", lambda: clock[0])
+    monkeypatch.setenv("MAX_SOL_PER_RUN", "0.5")
+    a = args(tmp_path, "--shift-gap", "2", "--shift-cooldown-seconds", "1800")
+    a.duration_seconds, a.refresh_interval = 3700, 30
+    report = experiment.run_experiment(bridge, a, tmp_path, AdvancingStop(), account_reader(bridge))
+    log = ReplayLog(str(tmp_path / "run.jsonl"))
+    assert report["cleanup_complete"] is True and report["n_shifts"] == 2
+    assert len(log.by_type("shift_deferred")) == 2
+    assert [c[0] for c in bridge.calls] == [
+        "deposit", "deposit", "withdraw", "withdraw", "deposit", "withdraw", "deposit", "withdraw",
+    ]
+
+
+def test_shift_cooldown_rejects_nonfinite_values(tmp_path):
+    with pytest.raises(SystemExit):
+        args(tmp_path, "--shift-cooldown-seconds", "nan")
+
+
+def test_shift_is_cancelled_if_price_returns_before_withdrawal(tmp_path):
+    class RevertingBridge(Bridge):
+        def __init__(self):
+            super().__init__()
+            self.reads = 0
+
+        def get_state(self, pool):
+            self.reads += 1
+            if self.reads == 4:
+                self.active_bin = 7  # snapshot sees a two-bin exit
+            if self.reads == 5:
+                self.active_bin = 0  # pre-withdraw recheck sees the reversal
+            return super().get_state(pool)
+
+    bridge = RevertingBridge()
+    report = experiment.run_experiment(
+        bridge, args(tmp_path, "--shift-gap", "2"), tmp_path, Event(), account_reader(bridge))
+    assert report["cleanup_complete"] is True and report["n_shifts"] == 0
+    log = ReplayLog(str(tmp_path / "run.jsonl"))
+    assert len(log.by_type("shift_cancelled")) == 1
+    assert not log.by_type("shift_skipped")
     assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]

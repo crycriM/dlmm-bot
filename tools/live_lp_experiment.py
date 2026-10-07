@@ -47,6 +47,13 @@ WITHDRAW_CHARGE = 2 * TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS
 DRIFT_ERRORS = ("active_bin_slippage_exceeded", "bins_cross_active")
 
 
+def shift_status(active, ranges, last_adjustment_at, now, cooldown_seconds):
+    lo = min(r[0] for r in ranges.values())
+    hi = max(r[1] for r in ranges.values())
+    return (max(lo - active, active - hi, 0),
+            max(cooldown_seconds - (now - last_adjustment_at), 0.0))
+
+
 def per_bin(amount: float, decimals: int, width: int) -> list[float]:
     """Equal per-bin amounts in whole raw token units.
 
@@ -92,8 +99,10 @@ def build_args(argv=None):
     p.add_argument("--refresh-interval", type=float, default=30)
     p.add_argument("--width", type=int, default=5)
     p.add_argument("--shift-gap", type=int, default=0,
-                   help="bins past both ranges before all liquidity moves one-sided next to "
-                        "the price (fees compound into it); 0 = fixed ranges")
+                   help="bins beyond the combined outer edge before liquidity shifts "
+                        "one-sided next to the price; 0 = fixed ranges")
+    p.add_argument("--shift-cooldown-seconds", type=float, default=0,
+                   help="minimum time since opening or the last completed shift")
     p.add_argument("--live", action="store_true")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
@@ -105,6 +114,8 @@ def build_args(argv=None):
             p.error(f"{name} must be finite and in (0, {maximum}]")
     if not 0 <= args.shift_gap <= 200:
         p.error("shift_gap must be in [0, 200]")
+    if not math.isfinite(args.shift_cooldown_seconds) or not 0 <= args.shift_cooldown_seconds <= 7200:
+        p.error("shift_cooldown_seconds must be finite and in [0, 7200]")
     return args
 
 
@@ -173,6 +184,8 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
     last_active = None
     n_shifts = 0
     shift_skip_logged = False
+    shift_deferred_logged = False
+    last_adjustment_at = None
 
     def state():
         result = bridge.get_state(args.pool)
@@ -309,9 +322,16 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
 
         Every range is past the price by then, so it is all one token: no swap.
         """
-        nonlocal n_shifts, outlay
-        side = "bid" if last_active > max(hi for _, hi in ranges.values()) else "ask"
-        log.emit("shift_started", side=side, active_bin=last_active, ranges=ranges)
+        nonlocal n_shifts, outlay, last_adjustment_at
+        active_now = int(state()["active_bin"])
+        gap, _ = shift_status(active_now, ranges, last_adjustment_at, time.monotonic(),
+                              args.shift_cooldown_seconds)
+        if gap < args.shift_gap:
+            log.emit("shift_cancelled", reason="price returned before withdrawal",
+                     active_bin=active_now, gap_bins=gap)
+            return False
+        side = "bid" if active_now > max(hi for _, hi in ranges.values()) else "ask"
+        log.emit("shift_started", side=side, active_bin=active_now, ranges=ranges)
         for pid in list(opened):
             close(pid)
         token, decimals = (("quote", grid.quote_decimals) if side == "bid"
@@ -353,9 +373,10 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
             outlay += candidate["rent_lamports"] + TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS
             ranges[pid] = (leg["bin_ids"][0], leg["bin_ids"][-1])
             n_shifts += 1
+            last_adjustment_at = time.monotonic()
             log.emit("shift_done", shift=n_shifts, side=side, position_id=pid, bins=ranges[pid],
                      amount_raw=owned)
-            return
+            return True
 
     try:
         data = state()
@@ -457,6 +478,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                                  position_id=pid, reason="confirmed or unsigned active-bin rejection")
                         if attempt == 3:
                             raise
+            last_adjustment_at = time.monotonic()
             reason = "duration_elapsed"
             while True:
                 pnl = snapshot()
@@ -469,23 +491,32 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
                 if stop.is_set():
                     reason = "signal"
                     break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 if args.shift_gap and ranges:
-                    lo = min(r[0] for r in ranges.values())
-                    hi = max(r[1] for r in ranges.values())
-                    if max(lo - last_active, last_active - hi, 0) >= args.shift_gap:
+                    gap, cooldown_left = shift_status(
+                        last_active, ranges, last_adjustment_at, time.monotonic(),
+                        args.shift_cooldown_seconds)
+                    if gap >= args.shift_gap and cooldown_left > 0:
+                        if not shift_deferred_logged:
+                            log.emit("shift_deferred", reason="cooldown", gap_bins=gap,
+                                     remaining_seconds=cooldown_left)
+                            shift_deferred_logged = True
+                    elif gap >= args.shift_gap:
+                        shift_deferred_logged = False
                         # Closes now, the new deposit, and its own final close.
                         need = (len(opened) + 1) * WITHDRAW_CHARGE + (
                             inspected["rent_lamports"] // 2 + TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS)
                         if outlay + need <= float(os.environ["MAX_SOL_PER_RUN"]) * 1e9:
-                            shift()
-                            continue
-                        if not shift_skip_logged:
+                            if shift():
+                                continue
+                        elif not shift_skip_logged:
                             log.emit("shift_skipped", reason="MAX_SOL_PER_RUN would be exceeded",
                                      outlay_lamports=outlay, need_lamports=need)
                             shift_skip_logged = True
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+                    else:
+                        shift_deferred_logged = False
                 stop.wait(min(args.refresh_interval, remaining))
     except Exception as exc:
         error = str(exc)

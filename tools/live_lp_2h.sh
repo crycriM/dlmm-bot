@@ -43,5 +43,6 @@ exec flock -n "$DLMM_ROOT/logs/live-experiment-wallet.lock" \
   --quote-mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v \
   --wallet "$WALLET_PUBKEY" --capital "${EXPERIMENT_CAPITAL:-10}" \
   --loss-limit "${EXPERIMENT_LOSS_LIMIT:-1}" --fee-budget-sol 0.01 \
-  --duration-seconds 7200 --width 20 --shift-gap ${EXPERIMENT_SHIFT_GAP:-30} --refresh-interval 30 \
+  --duration-seconds 7200 --width 20 --shift-gap "${EXPERIMENT_SHIFT_GAP:-2}" \
+  --shift-cooldown-seconds "${EXPERIMENT_SHIFT_COOLDOWN_SECONDS:-1800}" --refresh-interval 30 \
   --out "$RUN_DIR" "${EXTRA[@]}"
