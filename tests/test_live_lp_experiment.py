@@ -84,8 +84,9 @@ class Bridge:
 
 
 def args(tmp_path, *extra):
+    # --sol-usd 1000 = the fixture's mid at bin 0, so gas books as it did when base was SOL.
     return experiment.build_args([
-        "--pool", "pool", "--base-mint", "base", "--quote-mint", "quote",
+        "--pool", "pool", "--base-mint", "base", "--quote-mint", "quote", "--sol-usd", "1000",
         "--wallet", "wallet", "--out", str(tmp_path), "--live",
         "--duration-seconds", "0.05", "--refresh-interval", "0.001", *extra,
     ])
@@ -571,3 +572,40 @@ def test_shift_is_cancelled_if_price_returns_before_withdrawal(tmp_path):
     assert len(log.by_type("shift_cancelled")) == 1
     assert not log.by_type("shift_skipped")
     assert [c[0] for c in bridge.calls] == ["deposit", "deposit", "withdraw", "withdraw"]
+
+
+@pytest.mark.parametrize("base, quote, expected", [
+    (experiment.WSOL, "usdc", 120.0),   # SOL-USDC: SOL is the base, priced at mid
+    ("zbcn", experiment.WSOL, 1.0),     # ZBCN-SOL: gas is already in quote units
+    ("met", "usdc", 150.0),             # MET-USDC / USD1-USDC: static launch price
+])
+def test_gas_is_valued_in_quote_units_for_every_pair_shape(base, quote, expected):
+    a = experiment.argparse.Namespace(base_mint=base, quote_mint=quote, sol_usd=150.0)
+    assert experiment.sol_in_quote(a, mid=120.0) == expected
+
+
+def test_capital_cap_stays_32_usd_when_the_quote_is_wsol(tmp_path):
+    common = ["--pool", "p", "--base-mint", "zbcn", "--quote-mint", experiment.WSOL,
+              "--wallet", "w", "--out", str(tmp_path)]
+    ok = experiment.build_args(common + ["--sol-usd", "120", "--capital", "0.26", "--loss-limit", "0.01"])
+    assert ok.capital == 0.26
+    with pytest.raises(SystemExit):  # 10 SOL is not $10
+        experiment.build_args(common + ["--sol-usd", "120", "--capital", "10", "--loss-limit", "1"])
+    with pytest.raises(SystemExit):  # no SOL price, no cap and no gas valuation
+        experiment.build_args(common + ["--capital", "0.08", "--loss-limit", "0.008"])
+
+
+def test_wsol_quote_run_books_receipt_gas_in_sol(tmp_path):
+    bridge = Bridge()
+    state = bridge.get_state
+    def wsol_quoted(pool):
+        result = state(pool)
+        result.data["token_y"]["mint"] = experiment.WSOL
+        return result
+    bridge.get_state = wsol_quoted
+    a = args(tmp_path, "--quote-mint", experiment.WSOL, "--sol-usd", "120",
+             "--capital", "0.2", "--loss-limit", "0.1")
+    report = experiment.run_experiment(bridge, a, tmp_path, Event(), account_reader(bridge))
+    assert report["cleanup_complete"] is True and report["error"] is None
+    assert report["fee_lamports"] == 20_000
+    assert report["pnl"]["total_pnl"] == pytest.approx(-0.00002)  # 20,000 lamports, not x mid

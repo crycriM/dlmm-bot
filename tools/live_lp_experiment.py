@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Bounded live SOL/USDC LP experiment, not a profitability rollout.
+"""Bounded live Meteora DLMM LP experiment, not a profitability rollout.
 
-Two fixed, five-bin, one-sided positions; no token swaps, refreshes or perp
-hedge. Actual position amounts and fees replace inferred crossing fills.
+Two initially one-sided positions; optional no-swap, one-sided range shifts.
+Actual position amounts and fees replace inferred crossing fills.
 Default is a brief unsigned preflight. Signing additionally requires --live,
 LIVE_WRITE_CONFIRM=yes and DRY_RUN=false. Timeout/ambiguous submission stops
 all writes: known deterministic PDAs remain in the durable log for recovery.
@@ -45,6 +45,20 @@ SIGNATURE_LAMPORTS = 5_000
 WITHDRAW_CHARGE = 2 * TOKEN_ACCOUNT_LAMPORTS + SIGNATURE_LAMPORTS
 # Unsigned, deterministic rejections caused by the price moving: re-plan.
 DRIFT_ERRORS = ("active_bin_slippage_exceeded", "bins_cross_active")
+WSOL = "So11111111111111111111111111111111111111112"
+
+
+def sol_in_quote(args, mid: float) -> float:
+    """Quote units per SOL, to book receipt lamports in the ledger's currency.
+
+    ponytail: a non-SOL quote is taken as USD-pegged (USDC/USD1) and SOL is priced at
+    the static --sol-usd launch value; gas is ~$0.005 a run, so its drift is noise.
+    """
+    if args.base_mint == WSOL:
+        return mid
+    if args.quote_mint == WSOL:
+        return 1.0
+    return args.sol_usd
 
 
 def shift_status(active, ranges, last_adjustment_at, now, cooldown_seconds):
@@ -103,10 +117,17 @@ def build_args(argv=None):
                         "one-sided next to the price; 0 = fixed ranges")
     p.add_argument("--shift-cooldown-seconds", type=float, default=0,
                    help="minimum time since opening or the last completed shift")
+    p.add_argument("--sol-usd", type=float, default=None,
+                   help="USD per SOL at launch; required unless the base is wSOL "
+                        "(prices receipt gas, and the $32 cap when the quote is wSOL)")
     p.add_argument("--live", action="store_true")
     p.add_argument("--out", required=True)
     args = p.parse_args(argv)
-    for name, maximum in (("capital", 32), ("loss_limit", args.capital),
+    if args.base_mint != WSOL and not (args.sol_usd and math.isfinite(args.sol_usd) and args.sol_usd > 0):
+        p.error("--sol-usd must be a positive price unless the base token is wSOL")
+    # Capital and loss limit are quote units; the $32 cap is not.
+    quote_usd = args.sol_usd if args.quote_mint == WSOL else 1.0
+    for name, maximum in (("capital", 32 / quote_usd), ("loss_limit", args.capital),
                           ("fee_budget_sol", .01), ("duration_seconds", 7200),
                           ("refresh_interval", 30), ("width", 20)):
         value = getattr(args, name)
@@ -162,7 +183,7 @@ def inspect_stream(pool):
 
 
 def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
-    ledger = PnLLedger("meteora", "SOL/USDC-live-experiment")
+    ledger = PnLLedger("meteora", f"{args.pool}-live-experiment")
     log = EventLog(str(run_dir / "run.jsonl"), config_hash=hashlib.sha256(
         json.dumps(vars(args), sort_keys=True).encode()).hexdigest())
     opened, proposed, legs = [], [], []
@@ -235,7 +256,7 @@ def run_experiment(bridge, args, run_dir, stop, accounts=inspect_accounts):
         if result.total_fee_lamports is not None:
             fees += result.total_fee_lamports
             ledger.on_cash_flow("rebalance", time.time(),
-                                -result.total_fee_lamports / 1e9 * mid, label=verb)
+                                -result.total_fee_lamports / 1e9 * sol_in_quote(args, mid), label=verb)
         if not result.ok:
             if verb == "deposit_single_sided" and not unknown:
                 opened.remove(pid)  # proven rejection or failed receipt: no position was created

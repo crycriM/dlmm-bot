@@ -84,6 +84,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pool", required=True)
     parser.add_argument("--wallet", required=True)
+    parser.add_argument("--base-mint", required=True)
+    parser.add_argument("--quote-mint", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("position_ids", nargs="+")
     args = parser.parse_args(argv)
@@ -98,8 +100,7 @@ def main(argv=None):
     os.environ.clear()
     os.environ.update(inherited)
     os.environ.update({"DRY_RUN": "false", "POOL_ALLOWLIST": args.pool,
-                       "MINT_ALLOWLIST": "So11111111111111111111111111111111111111112,"
-                                         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                       "MINT_ALLOWLIST": f"{args.base_mint},{args.quote_mint}",
                        "SWAP_STREAM_PATH": str(run_dir / "swaps.jsonl"),
                        "EXECUTOR_LOG_DIR": str(run_dir / "executor")})
     bridge = ExecBridge(["node", "dist/bridge.js"], cwd=str(EXECUTOR), timeout=120)
