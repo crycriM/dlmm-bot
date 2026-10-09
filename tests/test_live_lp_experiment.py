@@ -237,14 +237,14 @@ def test_preflight_only_never_calls_a_write_verb(tmp_path):
 @pytest.mark.parametrize("override", [
     {"DRY_RUN": "true"}, {"LIVE_WRITE_CONFIRM": ""},
     {"MAX_SOL_PER_RUN": "10"}, {"JITO_ENABLED": "true"},
-    {"MAX_PRIORITY_FEE_LAMPORTS": "10001"},
+    {"MAX_PRIORITY_FEE_LAMPORTS": "50001"},
 ])
 def test_live_environment_fails_closed(tmp_path, override):
     env = {"SOLANA_RPC_URL": "https://rpc.test", "WALLET_PUBKEY": "wallet",
            "LIVE_WRITE_CONFIRM": "yes", "DRY_RUN": "false",
            "MAX_SOL_PER_TX": "0.23", "MAX_SOL_PER_RUN": "0.25",
            "MAX_SLIPPAGE_BPS": "25", "MAX_ACTIVE_BIN_SLIPPAGE_BINS": "1",
-           "MAX_PRIORITY_FEE_LAMPORTS": "10000", "JITO_ENABLED": "false"} | override
+           "MAX_PRIORITY_FEE_LAMPORTS": "50000", "JITO_ENABLED": "false"} | override
     with patch.dict(os.environ, env, clear=True), pytest.raises(ValueError):
         experiment.validate_environment(args(tmp_path))
 

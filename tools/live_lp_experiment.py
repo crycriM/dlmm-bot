@@ -151,7 +151,7 @@ def validate_environment(args):
     if os.environ.get("LIVE_WRITE_CONFIRM") != "yes" or os.environ.get("DRY_RUN") != "false":
         raise ValueError("--live requires LIVE_WRITE_CONFIRM=yes and DRY_RUN=false")
     for key, maximum in (("MAX_SOL_PER_TX", .23), ("MAX_SOL_PER_RUN", .5),
-                         ("MAX_SLIPPAGE_BPS", 25), ("MAX_PRIORITY_FEE_LAMPORTS", 10000)):
+                         ("MAX_SLIPPAGE_BPS", 25), ("MAX_PRIORITY_FEE_LAMPORTS", 50000)):
         value = float(os.environ.get(key, "nan"))
         if not math.isfinite(value) or not 0 <= value <= maximum:
             raise ValueError(f"{key} must be finite and <= {maximum}")
